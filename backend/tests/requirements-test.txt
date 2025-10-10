@@ -1,0 +1,17 @@
+# Test Requirements
+pytest==7.4.0
+pytest-asyncio==0.21.1
+httpx==0.24.1
+websockets==11.0.2
+
+# Add to backend requirements.txt for testing
+fastapi[all]
+uvicorn[standard]
+sqlalchemy
+python-jose[cryptography] 
+passlib[bcrypt]
+python-multipart
+scikit-learn
+pandas
+numpy
+python-dotenv

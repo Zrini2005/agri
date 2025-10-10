@@ -1,0 +1,757 @@
+from fastapi import FastAPI, Depends, HTTPException, status, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from sqlalchemy.orm import Session
+from datetime import datetime, timedelta
+from typing import List, Dict, Any, Optional
+import json
+import asyncio
+import csv
+import io
+import tempfile
+import os
+
+from database import (
+    create_tables,
+    get_db,
+    SessionLocal,
+    User as DBUser,
+    Field as DBField,
+    Mission as DBMission,
+    Waypoint as DBWaypoint,
+    TelemetryLog as DBTelemetryLog,
+    MissionLog as DBMissionLog,
+    AIInsight as DBAIInsight,
+)
+import schemas
+from auth import (
+    authenticate_user, create_access_token, get_current_active_user, 
+    get_password_hash, get_admin_user
+)
+from config import settings
+try:
+    from ai_service import AIService
+except Exception:
+    # Provide a lightweight fallback AIService when heavy ML deps are missing
+    class AIService:
+        def __init__(self):
+            self.is_trained = False
+
+        async def predict_battery_drain(self, telemetry_history):
+            return {"error": "ML dependencies not installed", "confidence": 0.0}
+
+        async def detect_anomaly(self, telemetry_data):
+            # Simple rule-based fallback
+            return {
+                "is_anomaly": False,
+                "confidence": 0.0,
+                "message": "Fallback AI - no ML available",
+                "timestamp": datetime.utcnow().isoformat()
+            }
+
+from websocket_manager import WebSocketManager
+
+# Create FastAPI app
+app = FastAPI(
+    title="Agriculture Drone GCS API",
+    description="Ground Control Station API for agricultural drones",
+    version="1.0.0"
+)
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.allowed_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Initialize services
+ai_service = AIService()
+websocket_manager = WebSocketManager()
+
+# Create backwards-compatible aliases so existing code referencing
+# User, Field, Mission, etc. continues to work without rewriting every occurrence.
+User = DBUser
+Field = DBField
+Mission = DBMission
+Waypoint = DBWaypoint
+TelemetryLog = DBTelemetryLog
+MissionLog = DBMissionLog
+AIInsight = DBAIInsight
+
+# Create database tables on startup
+@app.on_event("startup")
+async def startup_event():
+    create_tables()
+    print("Database tables created successfully")
+    print(f"Server starting on {settings.database_url}")
+
+
+# Health check endpoint
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy", "timestamp": datetime.utcnow()}
+
+
+# Authentication endpoints
+@app.post("/auth/register", response_model=schemas.User)
+async def register(user_data: schemas.UserCreate, db: Session = Depends(get_db)):
+    """Register a new user."""
+    # Check if user exists
+    if db.query(User).filter(User.username == user_data.username).first():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Username already registered"
+        )
+    
+    if db.query(User).filter(User.email == user_data.email).first():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email already registered"
+        )
+    
+    # Create new user
+    hashed_password = get_password_hash(user_data.password)
+    db_user = User(
+        username=user_data.username,
+        email=user_data.email,
+        full_name=user_data.full_name,
+        hashed_password=hashed_password
+    )
+    db.add(db_user)
+    db.commit()
+    db.refresh(db_user)
+    return db_user
+
+
+@app.post("/auth/login", response_model=schemas.Token)
+async def login(user_credentials: schemas.UserLogin, db: Session = Depends(get_db)):
+    """Login user and return access token."""
+    user = authenticate_user(db, user_credentials.username, user_credentials.password)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    access_token_expires = timedelta(minutes=settings.access_token_expire_minutes)
+    access_token = create_access_token(
+        data={"sub": user.username}, expires_delta=access_token_expires
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
+
+
+@app.get("/auth/me", response_model=schemas.UserProfile)
+async def get_user_profile(current_user: DBUser = Depends(get_current_active_user)):
+    """Get current user profile."""
+    return current_user
+
+
+# Field management endpoints
+@app.get("/fields", response_model=List[schemas.Field])
+async def get_fields(
+    skip: int = 0, 
+    limit: int = 100,
+    current_user: DBUser = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Get user's fields."""
+    return db.query(Field).filter(Field.owner_id == current_user.id).offset(skip).limit(limit).all()
+
+
+@app.post("/fields", response_model=schemas.Field)
+async def create_field(
+    field_data: schemas.FieldCreate,
+    current_user: DBUser = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Create a new field."""
+    db_field = Field(**field_data.dict(), owner_id=current_user.id)
+    db.add(db_field)
+    db.commit()
+    db.refresh(db_field)
+    return db_field
+
+
+@app.get("/fields/{field_id}", response_model=schemas.Field)
+async def get_field(
+    field_id: int,
+    current_user: DBUser = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Get field by ID."""
+    field = db.query(Field).filter(
+        Field.id == field_id, Field.owner_id == current_user.id
+    ).first()
+    if not field:
+        raise HTTPException(status_code=404, detail="Field not found")
+    return field
+
+
+@app.put("/fields/{field_id}", response_model=schemas.Field)
+async def update_field(
+    field_id: int,
+    field_update: schemas.FieldUpdate,
+    current_user: DBUser = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Update field."""
+    field = db.query(Field).filter(
+        Field.id == field_id, Field.owner_id == current_user.id
+    ).first()
+    if not field:
+        raise HTTPException(status_code=404, detail="Field not found")
+    
+    update_data = field_update.dict(exclude_unset=True)
+    for key, value in update_data.items():
+        setattr(field, key, value)
+    
+    db.commit()
+    db.refresh(field)
+    return field
+
+
+@app.delete("/fields/{field_id}")
+async def delete_field(
+    field_id: int,
+    current_user: DBUser = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Delete field."""
+    field = db.query(Field).filter(
+        Field.id == field_id, Field.owner_id == current_user.id
+    ).first()
+    if not field:
+        raise HTTPException(status_code=404, detail="Field not found")
+    
+    db.delete(field)
+    db.commit()
+    return {"message": "Field deleted successfully"}
+
+
+# Mission management endpoints
+@app.get("/missions", response_model=List[schemas.MissionSummary])
+async def get_missions(
+    skip: int = 0,
+    limit: int = 100,
+    current_user: DBUser = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Get user's missions."""
+    missions = db.query(Mission).filter(Mission.owner_id == current_user.id).offset(skip).limit(limit).all()
+    
+    result = []
+    for mission in missions:
+        field = db.query(Field).filter(Field.id == mission.field_id).first()
+        duration_minutes = None
+        if mission.started_at and mission.completed_at:
+            duration = mission.completed_at - mission.started_at
+            duration_minutes = duration.total_seconds() / 60
+        
+        result.append(schemas.MissionSummary(
+            id=mission.id,
+            name=mission.name,
+            mission_type=mission.mission_type,
+            status=mission.status,
+            field_name=field.name if field else "Unknown",
+            created_at=mission.created_at,
+            started_at=mission.started_at,
+            completed_at=mission.completed_at,
+            duration_minutes=duration_minutes
+        ))
+    
+    return result
+
+
+@app.post("/missions", response_model=schemas.Mission)
+async def create_mission(
+    mission_data: schemas.MissionCreate,
+    current_user: DBUser = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Create a new mission."""
+    # Verify field ownership
+    field = db.query(Field).filter(
+        Field.id == mission_data.field_id, Field.owner_id == current_user.id
+    ).first()
+    if not field:
+        raise HTTPException(status_code=404, detail="Field not found")
+    
+    # Create mission
+    db_mission = Mission(
+        name=mission_data.name,
+        mission_type=mission_data.mission_type,
+        altitude_m=mission_data.altitude_m,
+        speed_ms=mission_data.speed_ms,
+        field_id=mission_data.field_id,
+        owner_id=current_user.id
+    )
+    db.add(db_mission)
+    db.commit()
+    db.refresh(db_mission)
+    
+    # Create waypoints
+    for waypoint_data in mission_data.waypoints:
+        db_waypoint = Waypoint(**waypoint_data.dict(), mission_id=db_mission.id)
+        db.add(db_waypoint)
+    
+    db.commit()
+    
+    # Reload mission with waypoints
+    db.refresh(db_mission)
+    return db_mission
+
+
+@app.get("/missions/{mission_id}", response_model=schemas.Mission)
+async def get_mission(
+    mission_id: int,
+    current_user: DBUser = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Get mission by ID."""
+    mission = db.query(Mission).filter(
+        Mission.id == mission_id, Mission.owner_id == current_user.id
+    ).first()
+    if not mission:
+        raise HTTPException(status_code=404, detail="Mission not found")
+    return mission
+
+
+@app.put("/missions/{mission_id}", response_model=schemas.Mission)
+async def update_mission(
+    mission_id: int,
+    mission_update: schemas.MissionUpdate,
+    current_user: DBUser = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Update mission."""
+    mission = db.query(Mission).filter(
+        Mission.id == mission_id, Mission.owner_id == current_user.id
+    ).first()
+    if not mission:
+        raise HTTPException(status_code=404, detail="Mission not found")
+    
+    if mission.status in ["running", "completed"]:
+        raise HTTPException(
+            status_code=400, 
+            detail="Cannot update mission that is running or completed"
+        )
+    
+    update_data = mission_update.dict(exclude_unset=True)
+    for key, value in update_data.items():
+        setattr(mission, key, value)
+    
+    db.commit()
+    db.refresh(mission)
+    return mission
+
+
+@app.delete("/missions/{mission_id}")
+async def delete_mission(
+    mission_id: int,
+    current_user: DBUser = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Delete mission."""
+    mission = db.query(Mission).filter(
+        Mission.id == mission_id, Mission.owner_id == current_user.id
+    ).first()
+    if not mission:
+        raise HTTPException(status_code=404, detail="Mission not found")
+    
+    if mission.status == "running":
+        raise HTTPException(status_code=400, detail="Cannot delete running mission")
+    
+    db.delete(mission)
+    db.commit()
+    return {"message": "Mission deleted successfully"}
+
+
+# Mission control endpoints
+@app.post("/missions/{mission_id}/start")
+async def start_mission(
+    mission_id: int,
+    current_user: DBUser = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Start mission execution."""
+    mission = db.query(Mission).filter(
+        Mission.id == mission_id, Mission.owner_id == current_user.id
+    ).first()
+    if not mission:
+        raise HTTPException(status_code=404, detail="Mission not found")
+    
+    if mission.status != "planned":
+        raise HTTPException(status_code=400, detail="Mission is not in planned state")
+    
+    mission.status = "running"
+    mission.started_at = datetime.utcnow()
+    db.commit()
+    
+    # Notify simulator via WebSocket
+    await websocket_manager.send_command({
+        "action": "start",
+        "mission_id": mission_id,
+        "waypoints": [{"lat": wp.latitude, "lng": wp.longitude, "alt": wp.altitude_m} 
+                     for wp in mission.waypoints]
+    })
+    
+    return {"message": "Mission started successfully"}
+
+
+@app.post("/missions/{mission_id}/pause")
+async def pause_mission(
+    mission_id: int,
+    current_user: DBUser = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Pause mission execution."""
+    mission = db.query(Mission).filter(
+        Mission.id == mission_id, Mission.owner_id == current_user.id
+    ).first()
+    if not mission:
+        raise HTTPException(status_code=404, detail="Mission not found")
+    
+    if mission.status != "running":
+        raise HTTPException(status_code=400, detail="Mission is not running")
+    
+    mission.status = "paused"
+    db.commit()
+    
+    await websocket_manager.send_command({"action": "pause", "mission_id": mission_id})
+    return {"message": "Mission paused successfully"}
+
+
+@app.post("/missions/{mission_id}/resume")
+async def resume_mission(
+    mission_id: int,
+    current_user: DBUser = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Resume mission execution."""
+    mission = db.query(Mission).filter(
+        Mission.id == mission_id, Mission.owner_id == current_user.id
+    ).first()
+    if not mission:
+        raise HTTPException(status_code=404, detail="Mission not found")
+    
+    if mission.status != "paused":
+        raise HTTPException(status_code=400, detail="Mission is not paused")
+    
+    mission.status = "running"
+    db.commit()
+    
+    await websocket_manager.send_command({"action": "resume", "mission_id": mission_id})
+    return {"message": "Mission resumed successfully"}
+
+
+@app.post("/missions/{mission_id}/abort")
+async def abort_mission(
+    mission_id: int,
+    current_user: DBUser = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Abort mission execution."""
+    mission = db.query(Mission).filter(
+        Mission.id == mission_id, Mission.owner_id == current_user.id
+    ).first()
+    if not mission:
+        raise HTTPException(status_code=404, detail="Mission not found")
+    
+    if mission.status not in ["running", "paused"]:
+        raise HTTPException(status_code=400, detail="Mission is not active")
+    
+    mission.status = "aborted"
+    mission.completed_at = datetime.utcnow()
+    db.commit()
+    
+    await websocket_manager.send_command({"action": "abort", "mission_id": mission_id})
+    return {"message": "Mission aborted successfully"}
+
+
+# Telemetry and logging endpoints
+@app.get("/telemetry/{mission_id}", response_model=List[schemas.TelemetryLog])
+async def get_telemetry(
+    mission_id: int,
+    skip: int = 0,
+    limit: int = 1000,
+    current_user: DBUser = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Get mission telemetry history."""
+    # Verify mission ownership
+    mission = db.query(Mission).filter(
+        Mission.id == mission_id, Mission.owner_id == current_user.id
+    ).first()
+    if not mission:
+        raise HTTPException(status_code=404, detail="Mission not found")
+    
+    return db.query(TelemetryLog).filter(
+        TelemetryLog.mission_id == mission_id
+    ).order_by(TelemetryLog.timestamp).offset(skip).limit(limit).all()
+
+
+@app.get("/logs", response_model=List[schemas.MissionLogEntry])
+async def get_mission_logs(
+    mission_id: Optional[int] = None,
+    log_level: Optional[schemas.LogLevel] = None,
+    skip: int = 0,
+    limit: int = 100,
+    current_user: DBUser = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Get mission logs with filters."""
+    query = db.query(MissionLog).join(Mission).filter(Mission.owner_id == current_user.id)
+    
+    if mission_id:
+        query = query.filter(MissionLog.mission_id == mission_id)
+    if log_level:
+        query = query.filter(MissionLog.log_level == log_level)
+    
+    return query.order_by(MissionLog.timestamp.desc()).offset(skip).limit(limit).all()
+
+
+@app.get("/logs/{mission_id}/export")
+async def export_mission_data(
+    mission_id: int,
+    format: str = "csv",
+    current_user: DBUser = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Export mission data as CSV or JSON."""
+    # Verify mission ownership
+    mission = db.query(Mission).filter(
+        Mission.id == mission_id, Mission.owner_id == current_user.id
+    ).first()
+    if not mission:
+        raise HTTPException(status_code=404, detail="Mission not found")
+    
+    # Get data
+    telemetry = db.query(TelemetryLog).filter(TelemetryLog.mission_id == mission_id).all()
+    logs = db.query(MissionLog).filter(MissionLog.mission_id == mission_id).all()
+    
+    if format == "csv":
+        # Create CSV
+        output = io.StringIO()
+        writer = csv.writer(output)
+        
+        # Telemetry data
+        writer.writerow(["Type", "Timestamp", "Latitude", "Longitude", "Altitude", "Speed", "Battery", "Message"])
+        for t in telemetry:
+            writer.writerow([
+                "telemetry", t.timestamp, t.latitude, t.longitude, 
+                t.altitude_m, t.speed_ms, t.battery_percent, ""
+            ])
+        
+        # Log data
+        for log in logs:
+            writer.writerow([
+                "log", log.timestamp, "", "", "", "", "", f"[{log.log_level}] {log.message}"
+            ])
+        
+        # Save to temp file
+        temp_file = tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False)
+        temp_file.write(output.getvalue())
+        temp_file.close()
+        
+        return FileResponse(
+            temp_file.name,
+            media_type='text/csv',
+            filename=f"mission_{mission_id}_data.csv"
+        )
+    
+    else:  # JSON format
+        data = {
+            "mission": {
+                "id": mission.id,
+                "name": mission.name,
+                "mission_type": mission.mission_type,
+                "status": mission.status,
+                "created_at": mission.created_at.isoformat(),
+                "started_at": mission.started_at.isoformat() if mission.started_at else None,
+                "completed_at": mission.completed_at.isoformat() if mission.completed_at else None
+            },
+            "telemetry": [
+                {
+                    "timestamp": t.timestamp.isoformat(),
+                    "latitude": t.latitude,
+                    "longitude": t.longitude,
+                    "altitude_m": t.altitude_m,
+                    "speed_ms": t.speed_ms,
+                    "battery_percent": t.battery_percent,
+                    "heading_deg": t.heading_deg
+                } for t in telemetry
+            ],
+            "logs": [
+                {
+                    "timestamp": log.timestamp.isoformat(),
+                    "level": log.log_level,
+                    "message": log.message,
+                    "data": log.data
+                } for log in logs
+            ]
+        }
+        
+        temp_file = tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False)
+        json.dump(data, temp_file, indent=2)
+        temp_file.close()
+        
+        return FileResponse(
+            temp_file.name,
+            media_type='application/json',
+            filename=f"mission_{mission_id}_data.json"
+        )
+
+
+# AI endpoints
+@app.get("/ai/anomalies/{mission_id}", response_model=List[schemas.AIInsight])
+async def get_anomalies(
+    mission_id: int,
+    current_user: DBUser = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Get AI anomaly detection results."""
+    # Verify mission ownership
+    mission = db.query(Mission).filter(
+        Mission.id == mission_id, Mission.owner_id == current_user.id
+    ).first()
+    if not mission:
+        raise HTTPException(status_code=404, detail="Mission not found")
+    
+    return db.query(AIInsight).filter(
+        AIInsight.mission_id == mission_id,
+        AIInsight.insight_type == "anomaly"
+    ).order_by(AIInsight.timestamp.desc()).all()
+
+
+@app.post("/ai/predict-battery")
+async def predict_battery_drain(
+    mission_id: int,
+    current_user: DBUser = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Predict battery drain for mission."""
+    # Verify mission ownership
+    mission = db.query(Mission).filter(
+        Mission.id == mission_id, Mission.owner_id == current_user.id
+    ).first()
+    if not mission:
+        raise HTTPException(status_code=404, detail="Mission not found")
+    
+    # Get recent telemetry
+    recent_telemetry = db.query(TelemetryLog).filter(
+        TelemetryLog.mission_id == mission_id
+    ).order_by(TelemetryLog.timestamp.desc()).limit(50).all()
+    
+    if not recent_telemetry:
+        raise HTTPException(status_code=400, detail="No telemetry data available")
+    
+    # Predict using AI service
+    prediction = await ai_service.predict_battery_drain(recent_telemetry)
+    
+    # Save insight
+    insight = AIInsight(
+        mission_id=mission_id,
+        insight_type="battery_prediction",
+        confidence_score=prediction["confidence"],
+        data=prediction,
+        message=f"Predicted battery drain: {prediction['drain_rate']:.2f}%/min"
+    )
+    db.add(insight)
+    db.commit()
+    
+    return prediction
+
+
+# WebSocket endpoint for real-time telemetry
+@app.websocket("/ws/telemetry/{mission_id}")
+async def websocket_telemetry(websocket: WebSocket, mission_id: int):
+    """WebSocket endpoint for real-time telemetry."""
+    await websocket_manager.connect_telemetry(websocket, mission_id)
+    try:
+        while True:
+            # Keep connection alive
+            await asyncio.sleep(1)
+    except WebSocketDisconnect:
+        websocket_manager.disconnect_telemetry(websocket, mission_id)
+
+
+# WebSocket endpoint for simulator commands
+@app.websocket("/ws/simulator")
+async def websocket_simulator(websocket: WebSocket):
+    """WebSocket endpoint for simulator communication."""
+    await websocket_manager.connect_simulator(websocket)
+    try:
+        while True:
+            data = await websocket.receive_text()
+            message = json.loads(data)
+            
+            # Process telemetry data
+            if message.get("type") == "telemetry":
+                await handle_telemetry_update(message["data"])
+            elif message.get("type") == "mission_complete":
+                await handle_mission_complete(message["data"])
+                
+    except WebSocketDisconnect:
+        websocket_manager.disconnect_simulator(websocket)
+
+
+async def handle_telemetry_update(telemetry_data: dict):
+    """Handle incoming telemetry data."""
+    # Save to database
+    db = SessionLocal()
+    try:
+        telemetry = TelemetryLog(**telemetry_data)
+        db.add(telemetry)
+        db.commit()
+        
+        # Check for anomalies
+        anomaly_result = await ai_service.detect_anomaly(telemetry_data)
+        if anomaly_result["is_anomaly"]:
+            insight = AIInsight(
+                mission_id=telemetry_data["mission_id"],
+                insight_type="anomaly",
+                confidence_score=anomaly_result["confidence"],
+                data=anomaly_result,
+                is_alert=True,
+                message=anomaly_result["message"]
+            )
+            db.add(insight)
+            db.commit()
+        
+        # Broadcast to connected clients
+        await websocket_manager.broadcast_telemetry(telemetry_data["mission_id"], telemetry_data)
+        
+    finally:
+        db.close()
+
+
+async def handle_mission_complete(data: dict):
+    """Handle mission completion."""
+    db = SessionLocal()
+    try:
+        mission = db.query(Mission).filter(Mission.id == data["mission_id"]).first()
+        if mission:
+            mission.status = "completed"
+            mission.completed_at = datetime.utcnow()
+            db.commit()
+            
+            # Log completion
+            log_entry = MissionLog(
+                mission_id=mission.id,
+                log_level="INFO",
+                message="Mission completed successfully",
+                data=data
+            )
+            db.add(log_entry)
+            db.commit()
+    finally:
+        db.close()
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
