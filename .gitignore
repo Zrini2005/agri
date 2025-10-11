@@ -1,6 +1,7 @@
 # Python Environment and Cache
 venv/
 __pycache__/
+backend/__pycache__/
 *.pyc
 *.sqlite
 *.db
