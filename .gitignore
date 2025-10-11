@@ -1,0 +1,11 @@
+# Python Environment and Cache
+venv/
+__pycache__/
+*.pyc
+*.sqlite
+*.db
+
+# Node.js / Frontend dependencies and build artifacts
+/frontend/node_modules
+/frontend/build
+/frontend/.cache
