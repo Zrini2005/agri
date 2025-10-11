@@ -53,7 +53,20 @@ const Register: React.FC = () => {
       await register(registerData);
       navigate('/dashboard');
     } catch (err: any) {
-      setError(err.response?.data?.detail || err.message || 'Registration failed');
+      // Some backend errors can be objects (validation errors) — stringify for safe rendering
+      const formatError = (e: any) => {
+        if (!e) return '';
+        if (typeof e === 'string') return e;
+        const detail = e.response?.data?.detail ?? e.message ?? e;
+        if (typeof detail === 'string') return detail;
+        try {
+          return JSON.stringify(detail);
+        } catch {
+          return String(detail);
+        }
+      };
+
+      setError(formatError(err) || 'Registration failed');
     } finally {
       setLoading(false);
     }

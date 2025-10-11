@@ -33,7 +33,20 @@ const Login: React.FC = () => {
       await login(credentials);
       navigate('/dashboard');
     } catch (err: any) {
-      setError(err.response?.data?.detail || 'Login failed');
+      // Some backend errors are objects (pydantic/validation) — stringify for safe rendering
+      const formatError = (e: any) => {
+        if (!e) return '';
+        if (typeof e === 'string') return e;
+        const detail = e.response?.data?.detail ?? e.message ?? e;
+        if (typeof detail === 'string') return detail;
+        try {
+          return JSON.stringify(detail);
+        } catch {
+          return String(detail);
+        }
+      };
+
+      setError(formatError(err) || 'Login failed');
     } finally {
       setLoading(false);
     }

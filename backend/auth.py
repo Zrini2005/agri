@@ -7,20 +7,51 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
 from database import get_db, User
 from config import settings
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Password hashing
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+# Use bcrypt_sha256 to avoid bcrypt's 72-byte limit (it hashes with SHA256 first).
+# Keep bcrypt as a secondary scheme for compatibility. Provide a pbkdf2 fallback
+# in case bcrypt backends are not available or raise unexpected errors.
+pwd_context = CryptContext(schemes=["bcrypt_sha256", "bcrypt"], deprecated="auto")
+# Fallback context for environments that lack a working bcrypt backend
+_pbkdf2_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 security = HTTPBearer()
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     """Verify a password against its hash."""
-    return pwd_context.verify(plain_password, hashed_password)
+    try:
+        return pwd_context.verify(plain_password, hashed_password)
+    except Exception as e:
+        logger.exception("Error verifying password with primary context, attempting pbkdf2 fallback")
+        try:
+            return _pbkdf2_context.verify(plain_password, hashed_password)
+        except Exception:
+            return False
 
 
 def get_password_hash(password: str) -> str:
     """Generate password hash."""
-    return pwd_context.hash(password)
+    try:
+        return pwd_context.hash(password)
+    except ValueError as ve:
+        # Common case: bcrypt rejects >72 bytes. Try pbkdf2 fallback.
+        logger.warning("Password hashing with bcrypt failed: %s. Falling back to pbkdf2_sha256.", ve)
+        try:
+            return _pbkdf2_context.hash(password)
+        except Exception as e:
+            logger.exception("Fallback pbkdf2 hashing also failed")
+            raise
+    except Exception as e:
+        # Unexpected errors (e.g. backend detection issues). Try pbkdf2 fallback then re-raise.
+        logger.exception("Unexpected error during password hashing, attempting fallback: %s", e)
+        try:
+            return _pbkdf2_context.hash(password)
+        except Exception:
+            raise
 
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
