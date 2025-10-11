@@ -1,6 +1,21 @@
 import React from 'react';
+import { useNavigate } from 'react-router-dom';
 
 const Dashboard: React.FC = () => {
+  const navigate = useNavigate();
+
+  const handleCreateField = () => {
+    navigate('/fields');
+  };
+
+  const handlePlanMission = () => {
+    navigate('/missions');
+  };
+
+  const handleViewReports = () => {
+    navigate('/reports');
+  };
+
   return (
     <div style={{ padding: '20px' }}>
       <h1>Agriculture Drone Ground Control Station</h1>
@@ -49,34 +64,43 @@ const Dashboard: React.FC = () => {
       <div style={{ marginTop: '40px' }}>
         <h3>Quick Actions</h3>
         <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
-          <button style={{
-            padding: '10px 20px',
-            backgroundColor: '#2e7d2e',
-            color: 'white',
-            border: 'none',
-            borderRadius: '4px',
-            cursor: 'pointer'
-          }}>
+          <button 
+            onClick={handleCreateField}
+            style={{
+              padding: '10px 20px',
+              backgroundColor: '#2e7d2e',
+              color: 'white',
+              border: 'none',
+              borderRadius: '4px',
+              cursor: 'pointer'
+            }}
+          >
             Create New Field
           </button>
-          <button style={{
-            padding: '10px 20px',
-            backgroundColor: '#ff9800',
-            color: 'white',
-            border: 'none',
-            borderRadius: '4px',
-            cursor: 'pointer'
-          }}>
+          <button 
+            onClick={handlePlanMission}
+            style={{
+              padding: '10px 20px',
+              backgroundColor: '#ff9800',
+              color: 'white',
+              border: 'none',
+              borderRadius: '4px',
+              cursor: 'pointer'
+            }}
+          >
             Plan Mission
           </button>
-          <button style={{
-            padding: '10px 20px',
-            backgroundColor: '#1976d2',
-            color: 'white',
-            border: 'none',
-            borderRadius: '4px',
-            cursor: 'pointer'
-          }}>
+          <button 
+            onClick={handleViewReports}
+            style={{
+              padding: '10px 20px',
+              backgroundColor: '#1976d2',
+              color: 'white',
+              border: 'none',
+              borderRadius: '4px',
+              cursor: 'pointer'
+            }}
+          >
             View Reports
           </button>
         </div>
