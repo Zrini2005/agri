@@ -63,6 +63,7 @@ const AppRoutes: React.FC = () => {
         <Route path="dashboard" element={<Dashboard />} />
         <Route path="fields" element={<Fields />} />
         <Route path="missions" element={<Missions />} />
+        <Route path="mission-execution" element={<MissionExecution />} />
         <Route path="missions/:missionId/execute" element={<MissionExecution />} />
         <Route path="reports" element={<Reports />} />
       </Route>

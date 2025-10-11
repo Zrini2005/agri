@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import {
   Box,
   Button,
@@ -30,21 +30,37 @@ import { MapContainer, TileLayer, FeatureGroup, useMap } from 'react-leaflet';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 import 'leaflet-draw/dist/leaflet.draw.css';
-
-// Import leaflet-draw
 import 'leaflet-draw';
 import { fieldsAPI } from '../services/api';
 import { Field, FieldCreate } from '../types';
 
-import 'leaflet-draw';
+// Fix Leaflet default markers (webpack / CRA require)
+delete (L.Icon.Default.prototype as any)._getIconUrl;
+L.Icon.Default.mergeOptions({
+  iconRetinaUrl: require('leaflet/dist/images/marker-icon-2x.png'),
+  iconUrl: require('leaflet/dist/images/marker-icon.png'),
+  shadowUrl: require('leaflet/dist/images/marker-shadow.png'),
+});
 
-// Custom Draw Control Component
+interface FieldFormData {
+  name: string;
+  description: string;
+  crop_type: string;
+  polygon_coordinates: GeoJSON.Polygon | null;
+  area_hectares?: number;
+}
+
+/* ---------------------------
+   DrawControl (top-level)
+   --------------------------- */
 const DrawControl: React.FC<{
   onCreated: (e: any) => void;
   onEdited: (e: any) => void;
   onDeleted: (e: any) => void;
   featureGroup: React.RefObject<L.FeatureGroup>;
-}> = ({ onCreated, onEdited, onDeleted, featureGroup }) => {
+  editEnabled?: boolean;
+  removeEnabled?: boolean;
+}> = ({ onCreated, onEdited, onDeleted, featureGroup, editEnabled = false, removeEnabled = false }) => {
   const map = useMap();
 
   useEffect(() => {
@@ -69,8 +85,8 @@ const DrawControl: React.FC<{
       },
       edit: {
         featureGroup: featureGroup.current,
-        edit: false,
-        remove: false,
+        edit: editEnabled ? {} : false,
+        remove: removeEnabled,
       },
     });
 
@@ -81,32 +97,209 @@ const DrawControl: React.FC<{
     map.on(L.Draw.Event.DELETED, onDeleted);
 
     return () => {
-      map.removeControl(drawControl);
+      try {
+        map.removeControl(drawControl);
+      } catch (e) {
+        // ignore if already removed
+      }
       map.off(L.Draw.Event.CREATED, onCreated);
       map.off(L.Draw.Event.EDITED, onEdited);
       map.off(L.Draw.Event.DELETED, onDeleted);
     };
-  }, [map, featureGroup, onCreated, onEdited, onDeleted]);
+  }, [map, featureGroup, onCreated, onEdited, onDeleted, editEnabled, removeEnabled]);
 
   return null;
 };
 
-// Fix Leaflet default markers
-delete (L.Icon.Default.prototype as any)._getIconUrl;
-L.Icon.Default.mergeOptions({
-  iconRetinaUrl: require('leaflet/dist/images/marker-icon-2x.png'),
-  iconUrl: require('leaflet/dist/images/marker-icon.png'),
-  shadowUrl: require('leaflet/dist/images/marker-shadow.png'),
-});
+/* ---------------------------
+   MapRenderer - ensures GeoJSON polygon is present in FeatureGroup
+   --------------------------- */
+const MapRenderer: React.FC<{
+  featureGroupRef: React.RefObject<L.FeatureGroup>;
+  geo?: GeoJSON.Polygon | null;
+}> = ({ featureGroupRef, geo }) => {
+  const map = useMap();
 
-interface FieldFormData {
-  name: string;
-  description: string;
-  crop_type: string;
-  polygon_coordinates: GeoJSON.Polygon | null;
-  area_hectares?: number;
-}
+  useEffect(() => {
+    if (!map || !featureGroupRef.current) return;
 
+    // Remove existing layers to stay in sync with the geo prop
+    featureGroupRef.current.clearLayers();
+
+    if (!geo) {
+      return;
+    }
+
+    // Create a GeoJSON layer and add sub-layers to the featureGroup
+    const layer = L.geoJSON(geo as any, {
+      style: { color: '#2e7d2e', weight: 2, fillOpacity: 0.3 },
+    });
+
+    layer.eachLayer((l: any) => {
+      featureGroupRef.current?.addLayer(l);
+    });
+
+    // Fit bounds if valid geometry
+    try {
+      const bounds = layer.getBounds();
+      if (bounds && bounds.isValid && bounds.isValid()) {
+        map.fitBounds(bounds, { padding: [20, 20] });
+      }
+    } catch (e) {
+      // ignore
+    }
+
+    // We intentionally do not clear layers on cleanup so editing UI remains stable while mounted.
+    return () => {
+      // noop
+    };
+  }, [map, featureGroupRef, geo]);
+
+  return null;
+};
+
+/* ---------------------------
+   MapDialog (MOVED to top-level and memoized)
+   --------------------------- */
+const MapDialog: React.FC<{
+  open: boolean;
+  onClose: () => void;
+  title: string;
+  formData: FieldFormData;
+  onFieldChange: (field: keyof FieldFormData, value: any) => void;
+  onFormSubmit: () => void;
+  editingField: Field | null;
+  cropTypes: string[];
+  featureGroupRef: React.RefObject<L.FeatureGroup>;
+  onMapCreated: (e: any) => void;
+  onMapEdited: (e: any) => void;
+  onMapDeleted: (e: any) => void;
+  calculateArea: (polygon: GeoJSON.Polygon) => number;
+  formatArea: (hectares?: number) => string;
+  center: [number, number];
+}> = React.memo(({
+  open,
+  onClose,
+  title,
+  formData,
+  onFieldChange,
+  onFormSubmit,
+  editingField,
+  cropTypes,
+  featureGroupRef,
+  onMapCreated,
+  onMapEdited,
+  onMapDeleted,
+  calculateArea,
+  formatArea,
+  center,
+}) => (
+  <Dialog open={open} onClose={onClose} maxWidth="lg" fullWidth>
+    <DialogTitle>{title}</DialogTitle>
+    <DialogContent>
+      <Box sx={{ mb: 2 }}>
+        <Grid container spacing={2}>
+          <Grid item xs={12} sm={6}>
+            <TextField
+              fullWidth
+              label="Field Name"
+              value={formData.name}
+              onChange={(e) => onFieldChange('name', e.target.value)}
+              required
+            />
+          </Grid>
+          <Grid item xs={12} sm={6}>
+            <FormControl fullWidth>
+              <InputLabel>Crop Type</InputLabel>
+              <Select
+                value={formData.crop_type}
+                label="Crop Type"
+                onChange={(e) => onFieldChange('crop_type', e.target.value)}
+              >
+                <MenuItem value="">
+                  <em>Select crop type</em>
+                </MenuItem>
+                {cropTypes.map((crop) => (
+                  <MenuItem key={crop} value={crop}>
+                    {crop}
+                  </MenuItem>
+                ))}
+              </Select>
+            </FormControl>
+          </Grid>
+          <Grid item xs={12}>
+            <TextField
+              fullWidth
+              label="Description"
+              multiline
+              rows={2}
+              value={formData.description}
+              onChange={(e) => onFieldChange('description', e.target.value)}
+            />
+          </Grid>
+        </Grid>
+      </Box>
+
+      <Typography variant="h6" gutterBottom>
+        Draw Field Boundary
+      </Typography>
+      <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+        Use the polygon tool to draw the field boundary on the map. Click the polygon icon in the toolbar, then click on the map to create points. Double-click to finish the polygon.
+      </Typography>
+
+      <Box sx={{ height: 400, border: '1px solid #ddd', borderRadius: 1 }}>
+        <MapContainer
+          center={center}
+          zoom={13}
+          style={{ height: '100%', width: '100%' }}
+          key={open ? 'open' : 'closed'} // Optional: remount when open changes to ensure MapContainer initialises cleanly
+        >
+          <TileLayer
+            url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+            attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+          />
+          <FeatureGroup ref={featureGroupRef}>
+            <DrawControl
+              onCreated={onMapCreated}
+              onEdited={onMapEdited}
+              onDeleted={onMapDeleted}
+              featureGroup={featureGroupRef}
+              editEnabled={!!editingField}
+              removeEnabled={!!editingField}
+            />
+          </FeatureGroup>
+
+          {/* Ensure existing polygon (from formData) is rendered into the featureGroup */}
+          <MapRenderer featureGroupRef={featureGroupRef} geo={formData.polygon_coordinates} />
+        </MapContainer>
+      </Box>
+
+      {formData.polygon_coordinates && (
+        <Box sx={{ mt: 2 }}>
+          <Chip
+            label={`Area: ${formatArea(calculateArea(formData.polygon_coordinates))}`}
+            color="primary"
+            variant="outlined"
+          />
+        </Box>
+      )}
+    </DialogContent>
+    <DialogActions>
+      <Button onClick={onClose}>Cancel</Button>
+      <Button
+        onClick={onFormSubmit}
+        variant="contained"
+        disabled={!formData.name.trim() || !formData.polygon_coordinates}
+      >
+        {editingField ? 'Update Field' : 'Create Field'}
+      </Button>
+    </DialogActions>
+  </Dialog>
+));
+
+/* ---------------------------
+   Main Fields component
+   --------------------------- */
 const Fields: React.FC = () => {
   const [fields, setFields] = useState<Field[]>([]);
   const [loading, setLoading] = useState(true);
@@ -123,7 +316,7 @@ const Fields: React.FC = () => {
   const [success, setSuccess] = useState<string>('');
   const featureGroupRef = useRef<L.FeatureGroup>(null);
 
-  const cropTypes = [
+  const cropTypes = useMemo(() => [
     'Corn',
     'Wheat',
     'Soybeans',
@@ -134,7 +327,7 @@ const Fields: React.FC = () => {
     'Sunflower',
     'Canola',
     'Other',
-  ];
+  ], []);
 
   useEffect(() => {
     loadFields();
@@ -152,24 +345,25 @@ const Fields: React.FC = () => {
     }
   };
 
-  const calculateArea = (polygon: GeoJSON.Polygon): number => {
-    // Simple area calculation using Shoelace formula
+  const defaultCenter = useMemo<[number, number]>(() => [40.7128, -74.0060], []);
+
+  const calculateArea = useCallback((polygon: GeoJSON.Polygon): number => {
     if (!polygon.coordinates || !polygon.coordinates[0]) return 0;
-    
     const coords = polygon.coordinates[0];
     let area = 0;
-    
     for (let i = 0; i < coords.length - 1; i++) {
       const [x1, y1] = coords[i];
       const [x2, y2] = coords[i + 1];
       area += x1 * y2 - x2 * y1;
     }
-    
     area = Math.abs(area) / 2;
-    // Convert from degrees to hectares (very rough approximation)
-    // This is simplified - in production you'd use proper geodesic calculations
-    return area * 111000 * 111000 / 10000; // rough conversion to hectares
-  };
+    return area * 111000 * 111000 / 10000;
+  }, []);
+
+  const formatArea = useCallback((hectares?: number) => {
+    if (!hectares) return 'N/A';
+    return `${hectares.toFixed(2)} ha`;
+  }, []);
 
   const handleCreateField = () => {
     setFormData({
@@ -178,6 +372,10 @@ const Fields: React.FC = () => {
       crop_type: '',
       polygon_coordinates: null,
     });
+    setEditingField(null);
+    if (featureGroupRef.current) {
+      featureGroupRef.current.clearLayers();
+    }
     setCreateDialogOpen(true);
   };
 
@@ -190,12 +388,15 @@ const Fields: React.FC = () => {
       polygon_coordinates: field.polygon_coordinates,
       area_hectares: field.area_hectares,
     });
+    // Keep any existing layers in featureGroup cleared then MapRenderer will add the geojson
+    if (featureGroupRef.current) {
+      featureGroupRef.current.clearLayers();
+    }
     setEditDialogOpen(true);
   };
 
   const handleDeleteField = async (fieldId: number) => {
     if (!window.confirm('Are you sure you want to delete this field?')) return;
-
     try {
       await fieldsAPI.deleteField(fieldId);
       setSuccess('Field deleted successfully');
@@ -210,12 +411,10 @@ const Fields: React.FC = () => {
       setError('Field name is required');
       return;
     }
-
     if (!formData.polygon_coordinates) {
       setError('Please draw a polygon on the map to define the field area');
       return;
     }
-
     try {
       const fieldData: FieldCreate = {
         name: formData.name.trim(),
@@ -255,151 +454,55 @@ const Fields: React.FC = () => {
     }
   };
 
-  const handleMapCreated = (e: any) => {
+  // stable handlers
+  const handleFieldChange = useCallback((field: keyof FieldFormData, value: any) => {
+    setFormData(prev => ({ ...prev, [field]: value }));
+  }, []);
+
+  const handleMapCreated = useCallback((e: any) => {
     const { layerType, layer } = e;
     if (layerType === 'polygon') {
-      // Clear existing polygons
+      // remove any other layers so we keep only one polygon
       if (featureGroupRef.current) {
-        featureGroupRef.current.eachLayer((existingLayer) => {
+        featureGroupRef.current.eachLayer((existingLayer: any) => {
           if (existingLayer !== layer) {
             featureGroupRef.current?.removeLayer(existingLayer);
           }
         });
+        // Ensure the new layer is added to the featureGroup (so edit controls can find it)
+        try {
+          featureGroupRef.current.addLayer(layer);
+        } catch (err) {
+          // ignore
+        }
       }
 
-      // Convert Leaflet polygon to GeoJSON
+      // Convert Leaflet polygon to GeoJSON and store
       const geoJSON = layer.toGeoJSON();
-      setFormData({
-        ...formData,
+      setFormData(prev => ({
+        ...prev,
         polygon_coordinates: geoJSON.geometry,
-      });
+      }));
     }
-  };
+  }, []);
 
-  const handleMapEdited = (e: any) => {
+  const handleMapEdited = useCallback((e: any) => {
     const layers = e.layers;
     layers.eachLayer((layer: any) => {
       const geoJSON = layer.toGeoJSON();
-      setFormData({
-        ...formData,
+      setFormData(prev => ({
+        ...prev,
         polygon_coordinates: geoJSON.geometry,
-      });
+      }));
     });
-  };
+  }, []);
 
-  const handleMapDeleted = (e: any) => {
-    setFormData({
-      ...formData,
+  const handleMapDeleted = useCallback((e: any) => {
+    setFormData(prev => ({
+      ...prev,
       polygon_coordinates: null,
-    });
-  };
-
-  const formatArea = (hectares?: number) => {
-    if (!hectares) return 'N/A';
-    return `${hectares.toFixed(2)} ha`;
-  };
-
-  const MapDialog = ({
-    open,
-    onClose,
-    title,
-  }: {
-    open: boolean;
-    onClose: () => void;
-    title: string;
-  }) => (
-    <Dialog open={open} onClose={onClose} maxWidth="lg" fullWidth>
-      <DialogTitle>{title}</DialogTitle>
-      <DialogContent>
-        <Box sx={{ mb: 2 }}>
-          <Grid container spacing={2}>
-            <Grid item xs={12} sm={6}>
-              <TextField
-                fullWidth
-                label="Field Name"
-                value={formData.name}
-                onChange={(e) => setFormData({ ...formData, name: e.target.value })}
-                required
-              />
-            </Grid>
-            <Grid item xs={12} sm={6}>
-              <FormControl fullWidth>
-                <InputLabel>Crop Type</InputLabel>
-                <Select
-                  value={formData.crop_type}
-                  label="Crop Type"
-                  onChange={(e) => setFormData({ ...formData, crop_type: e.target.value })}
-                >
-                  <MenuItem value="">
-                    <em>Select crop type</em>
-                  </MenuItem>
-                  {cropTypes.map((crop) => (
-                    <MenuItem key={crop} value={crop}>
-                      {crop}
-                    </MenuItem>
-                  ))}
-                </Select>
-              </FormControl>
-            </Grid>
-            <Grid item xs={12}>
-              <TextField
-                fullWidth
-                label="Description"
-                multiline
-                rows={2}
-                value={formData.description}
-                onChange={(e) => setFormData({ ...formData, description: e.target.value })}
-              />
-            </Grid>
-          </Grid>
-        </Box>
-
-        <Typography variant="h6" gutterBottom>
-          Draw Field Boundary
-        </Typography>
-        <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-          Use the polygon tool to draw the field boundary on the map. Click the polygon icon in the toolbar, then click on the map to create points.
-        </Typography>
-
-        <Box sx={{ height: 400, border: '1px solid #ddd', borderRadius: 1 }}>
-          <MapContainer
-            center={[40.7128, -74.0060]} // Default to New York
-            zoom={13}
-            style={{ height: '100%', width: '100%' }}
-          >
-            <TileLayer
-              url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-              attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-            />
-            <FeatureGroup ref={featureGroupRef}>
-              <DrawControl
-                onCreated={handleMapCreated}
-                onEdited={handleMapEdited}
-                onDeleted={handleMapDeleted}
-                featureGroup={featureGroupRef}
-              />
-            </FeatureGroup>
-          </MapContainer>
-        </Box>
-
-        {formData.polygon_coordinates && (
-          <Box sx={{ mt: 2 }}>
-            <Chip
-              label={`Area: ${formatArea(calculateArea(formData.polygon_coordinates))}`}
-              color="primary"
-              variant="outlined"
-            />
-          </Box>
-        )}
-      </DialogContent>
-      <DialogActions>
-        <Button onClick={onClose}>Cancel</Button>
-        <Button onClick={handleFormSubmit} variant="contained">
-          {editingField ? 'Update Field' : 'Create Field'}
-        </Button>
-      </DialogActions>
-    </Dialog>
-  );
+    }));
+  }, []);
 
   return (
     <Box sx={{ p: 3 }}>
@@ -497,6 +600,18 @@ const Fields: React.FC = () => {
           resetForm();
         }}
         title="Create New Field"
+        formData={formData}
+        onFieldChange={handleFieldChange}
+        onFormSubmit={handleFormSubmit}
+        editingField={editingField}
+        cropTypes={cropTypes}
+        featureGroupRef={featureGroupRef}
+        onMapCreated={handleMapCreated}
+        onMapEdited={handleMapEdited}
+        onMapDeleted={handleMapDeleted}
+        calculateArea={calculateArea}
+        formatArea={formatArea}
+        center={defaultCenter}
       />
 
       <MapDialog
@@ -506,6 +621,18 @@ const Fields: React.FC = () => {
           resetForm();
         }}
         title="Edit Field"
+        formData={formData}
+        onFieldChange={handleFieldChange}
+        onFormSubmit={handleFormSubmit}
+        editingField={editingField}
+        cropTypes={cropTypes}
+        featureGroupRef={featureGroupRef}
+        onMapCreated={handleMapCreated}
+        onMapEdited={handleMapEdited}
+        onMapDeleted={handleMapDeleted}
+        calculateArea={calculateArea}
+        formatArea={formatArea}
+        center={defaultCenter}
       />
 
       <Snackbar

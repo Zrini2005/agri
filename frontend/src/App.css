@@ -78,6 +78,21 @@ code {
   }
 }
 
+/* Custom Leaflet marker styles */
+.custom-drone-marker,
+.custom-waypoint-marker {
+  border: none !important;
+  background: transparent !important;
+}
+
+.custom-drone-marker div {
+  animation: pulse 2s infinite;
+}
+
+.custom-waypoint-marker.active div {
+  animation: pulse 1.5s infinite;
+}
+
 /* Mission status indicators */
 .status-planned {
   color: #3b82f6;
