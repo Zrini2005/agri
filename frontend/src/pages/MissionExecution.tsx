@@ -43,19 +43,6 @@ import { TelemetryWebSocket } from '../services/websocket';
 import { Mission, MissionSummary, TelemetryData, Field, MissionStatus } from '../types';
 import 'leaflet/dist/leaflet.css';
 
-// Component to automatically pan to drone position
-const MapController: React.FC<{ center: [number, number] | null; isRunning: boolean }> = ({ center, isRunning }) => {
-  const map = useMap();
-  
-  React.useEffect(() => {
-    if (center && isRunning) {
-      map.setView(center, map.getZoom(), { animate: true, duration: 0.5 });
-    }
-  }, [center, isRunning, map]);
-  
-  return null;
-};
-
 // Fix Leaflet default markers with proper URLs
 delete (L.Icon.Default.prototype as any)._getIconUrl;
 L.Icon.Default.mergeOptions({
@@ -122,6 +109,159 @@ interface SimulationState {
   totalDistance: number;
   distanceTraveled: number;
 }
+
+// Component to fit bounds on initial load - OUTSIDE main component
+const FitBoundsToWaypoints: React.FC<{ waypoints: any[] }> = React.memo(({ waypoints }) => {
+  const map = useMap();
+  
+  React.useEffect(() => {
+    if (waypoints.length > 0) {
+      const bounds = L.latLngBounds(waypoints.map(wp => [wp.latitude, wp.longitude]));
+      map.fitBounds(bounds, { padding: [50, 50], animate: false });
+    }
+  }, [waypoints, map]);
+  
+  return null;
+});
+
+// Component to update drone position and traveled path using SVG overlay - OUTSIDE main component
+const DroneUpdater: React.FC<{ 
+  waypoints: any[]; 
+  currentPosition: { lat: number; lng: number } | null;
+  currentWaypointIndex: number;
+  progress: number;
+}> = React.memo(({ waypoints, currentPosition, currentWaypointIndex, progress }) => {
+  const map = useMap();
+  const overlayRef = useRef<HTMLDivElement | null>(null);
+  const svgRef = useRef<SVGSVGElement | null>(null);
+  const pathRef = useRef<SVGPathElement | null>(null);
+  const droneRef = useRef<SVGGElement | null>(null);
+
+  // Initialize SVG overlay
+  useEffect(() => {
+    if (!overlayRef.current) {
+      // Create overlay container
+      overlayRef.current = document.createElement('div');
+      overlayRef.current.style.position = 'absolute';
+      overlayRef.current.style.top = '0';
+      overlayRef.current.style.left = '0';
+      overlayRef.current.style.width = '100%';
+      overlayRef.current.style.height = '100%';
+      overlayRef.current.style.pointerEvents = 'none';
+      overlayRef.current.style.zIndex = '1000';
+      
+      // Create SVG
+      svgRef.current = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      svgRef.current.style.width = '100%';
+      svgRef.current.style.height = '100%';
+      svgRef.current.style.position = 'absolute';
+      
+      // Create path for traveled route
+      pathRef.current = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+      pathRef.current.setAttribute('fill', 'none');
+      pathRef.current.setAttribute('stroke', '#4caf50');
+      pathRef.current.setAttribute('stroke-width', '4');
+      pathRef.current.setAttribute('stroke-opacity', '0.8');
+      pathRef.current.setAttribute('stroke-linecap', 'round');
+      pathRef.current.setAttribute('stroke-linejoin', 'round');
+      
+      // Create drone marker group
+      droneRef.current = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+      droneRef.current.innerHTML = `
+        <circle cx="0" cy="0" r="14" fill="#ff6b35" opacity="0.3">
+          <animate attributeName="r" values="14;20;14" dur="2s" repeatCount="indefinite" />
+          <animate attributeName="opacity" values="0.3;0;0.3" dur="2s" repeatCount="indefinite" />
+        </circle>
+        <circle cx="0" cy="0" r="12" fill="url(#droneGradient)" stroke="#ff6b35" stroke-width="3" />
+        <text x="0" y="5" text-anchor="middle" font-size="14" fill="white">🚁</text>
+      `;
+      
+      // Add gradient definition
+      const defs = document.createElementNS('http://www.w3.org/2000/svg', 'defs');
+      defs.innerHTML = `
+        <linearGradient id="droneGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+          <stop offset="0%" style="stop-color:#2e7d2e;stop-opacity:1" />
+          <stop offset="100%" style="stop-color:#4caf50;stop-opacity:1" />
+        </linearGradient>
+      `;
+      
+      svgRef.current.appendChild(defs);
+      svgRef.current.appendChild(pathRef.current);
+      svgRef.current.appendChild(droneRef.current);
+      overlayRef.current.appendChild(svgRef.current);
+      
+      // Add to map container
+      const mapContainer = map.getContainer();
+      mapContainer.appendChild(overlayRef.current);
+    }
+
+    return () => {
+      if (overlayRef.current && overlayRef.current.parentNode) {
+        overlayRef.current.parentNode.removeChild(overlayRef.current);
+        overlayRef.current = null;
+        svgRef.current = null;
+        pathRef.current = null;
+        droneRef.current = null;
+      }
+    };
+  }, [map]);
+
+  // Update overlay on map move/zoom or position change
+  useEffect(() => {
+    const updateOverlay = () => {
+      if (!pathRef.current || !droneRef.current || waypoints.length === 0) return;
+
+      // Build traveled path
+      const traveledPath: [number, number][] = [];
+      for (let i = 0; i <= currentWaypointIndex && i < waypoints.length; i++) {
+        const wp = waypoints[i];
+        traveledPath.push([wp.latitude, wp.longitude]);
+      }
+      
+      // Add current position if simulation is running
+      if (currentPosition && (currentWaypointIndex < waypoints.length - 1 || progress < 100)) {
+        traveledPath.push([currentPosition.lat, currentPosition.lng]);
+      }
+
+      // Convert lat/lng to screen coordinates and build SVG path
+      if (traveledPath.length > 0) {
+        let pathData = '';
+        traveledPath.forEach((coord, index) => {
+          const point = map.latLngToContainerPoint(L.latLng(coord[0], coord[1]));
+          if (index === 0) {
+            pathData = `M ${point.x} ${point.y}`;
+          } else {
+            pathData += ` L ${point.x} ${point.y}`;
+          }
+        });
+        pathRef.current.setAttribute('d', pathData);
+      } else {
+        pathRef.current.setAttribute('d', '');
+      }
+
+      // Update drone position
+      if (currentPosition) {
+        const dronePoint = map.latLngToContainerPoint(L.latLng(currentPosition.lat, currentPosition.lng));
+        droneRef.current.setAttribute('transform', `translate(${dronePoint.x}, ${dronePoint.y})`);
+        droneRef.current.style.display = 'block';
+      } else {
+        droneRef.current.style.display = 'none';
+      }
+    };
+
+    // Update on position change
+    updateOverlay();
+
+    // Update on map events
+    map.on('move zoom viewreset', updateOverlay);
+
+    return () => {
+      map.off('move zoom viewreset', updateOverlay);
+    };
+  }, [map, waypoints, currentPosition, currentWaypointIndex, progress]);
+
+  return null;
+});
 
 const MissionExecution: React.FC = () => {
   const { missionId } = useParams<{ missionId: string }>();
@@ -198,6 +338,18 @@ const MissionExecution: React.FC = () => {
       );
     }
     return total;
+  };
+
+  // Calculate bounds for all waypoints
+  const calculateBounds = (waypoints: any[]): L.LatLngBounds | null => {
+    if (waypoints.length === 0) return null;
+    
+    const bounds = L.latLngBounds(
+      waypoints.map(wp => L.latLng(wp.latitude, wp.longitude))
+    );
+    
+    // Add padding to bounds
+    return bounds.pad(0.2);
   };
 
   // Load missions on component mount
@@ -284,12 +436,20 @@ const MissionExecution: React.FC = () => {
       }
 
       // Start local simulation
+      const waypoints = selectedMission.waypoints;
+      const totalDistance = calculateTotalMissionDistance(waypoints);
+      
       setSimulationState(prev => ({
         ...prev,
         isRunning: true,
         currentWaypointIndex: 0,
         progress: 0,
         logs: [...prev.logs, `Mission started: ${new Date().toLocaleTimeString()}`],
+        currentPosition: { lat: waypoints[0].latitude, lng: waypoints[0].longitude },
+        targetPosition: waypoints.length > 1 ? { lat: waypoints[1].latitude, lng: waypoints[1].longitude } : null,
+        totalDistance,
+        distanceTraveled: 0,
+        interpolationProgress: 0,
       }));
 
       // Start simulation loop
@@ -385,19 +545,6 @@ const MissionExecution: React.FC = () => {
     if (!selectedMission || selectedMission.waypoints.length === 0) return;
 
     const waypoints = selectedMission.waypoints;
-    const totalDistance = calculateTotalMissionDistance(waypoints);
-    
-    // Initialize simulation state
-    setSimulationState(prev => ({
-      ...prev,
-      currentPosition: { lat: waypoints[0].latitude, lng: waypoints[0].longitude },
-      targetPosition: waypoints.length > 1 ? { lat: waypoints[1].latitude, lng: waypoints[1].longitude } : null,
-      totalDistance,
-      distanceTraveled: 0,
-      interpolationProgress: 0,
-      currentWaypointIndex: 0,
-    }));
-
     const missionStartTime = Date.now();
     const initialBatteryLevel = 100;
 
@@ -444,6 +591,7 @@ const MissionExecution: React.FC = () => {
               newState.targetPosition = null;
               newState.isRunning = false;
               newState.progress = 100;
+              newState.distanceTraveled = newState.totalDistance; // Ensure we show 100%
               newState.logs = [...prev.logs.slice(-50), 
                 `Mission completed: ${new Date().toLocaleTimeString()}`
               ];
@@ -470,8 +618,10 @@ const MissionExecution: React.FC = () => {
             newState.distanceTraveled += distanceStep;
           }
 
-          // Update overall progress
-          newState.progress = Math.min((newState.distanceTraveled / newState.totalDistance) * 100, 100);
+          // Update overall progress (ensure it goes from 0 to 100)
+          if (newState.totalDistance > 0) {
+            newState.progress = Math.min(100, (newState.distanceTraveled / newState.totalDistance) * 100);
+          }
 
           // Generate realistic telemetry
           const missionDuration = (Date.now() - missionStartTime) / 1000; // seconds
@@ -524,87 +674,6 @@ const MissionExecution: React.FC = () => {
       case 'aborted': return 'error';
       default: return 'default';
     }
-  };
-
-  const MapView = () => {
-    if (!selectedMission || !field) return null;
-
-    const waypoints = selectedMission.waypoints;
-    const waypointCoords: [number, number][] = waypoints.map(wp => [wp.latitude, wp.longitude]);
-    
-    // Use smooth current position if available, otherwise first waypoint
-    const centerPosition: [number, number] = simulationState.currentPosition 
-      ? [simulationState.currentPosition.lat, simulationState.currentPosition.lng]
-      : waypoints.length > 0 
-        ? [waypoints[0].latitude, waypoints[0].longitude] 
-        : [40.7128, -74.0060];
-    
-    return (
-      <MapContainer
-        center={centerPosition}
-        zoom={18}
-        style={{ height: '400px', width: '100%' }}
-        key={`map-${selectedMission.id}`} // Force re-render on mission change
-      >
-        <MapController 
-          center={simulationState.currentPosition ? [simulationState.currentPosition.lat, simulationState.currentPosition.lng] : null}
-          isRunning={simulationState.isRunning}
-        />
-        <TileLayer
-          url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-          attribution='&copy; OpenStreetMap contributors'
-        />
-        
-        {/* Field boundary */}
-        {field.polygon_coordinates && (
-          <GeoJSON
-            data={field.polygon_coordinates as any}
-            style={{ color: '#2e7d2e', weight: 2, fillOpacity: 0.2 }}
-          />
-        )}
-        
-        {/* Flight path */}
-        {waypointCoords.length > 1 && (
-          <Polyline
-            positions={waypointCoords}
-            color="#ff6b35"
-            weight={3}
-            opacity={0.7}
-          />
-        )}
-        
-        {/* Waypoint markers */}
-        {waypoints.map((waypoint, index) => (
-          <Marker
-            key={`waypoint-${waypoint.id}`}
-            position={[waypoint.latitude, waypoint.longitude]}
-            icon={createWaypointIcon(index + 1, index === simulationState.currentWaypointIndex)}
-          />
-        ))}
-        
-        {/* Current drone position (smooth interpolated position) */}
-        {simulationState.currentPosition && (
-          <Marker
-            key="drone-marker"
-            position={[simulationState.currentPosition.lat, simulationState.currentPosition.lng]}
-            icon={droneIcon}
-          />
-        )}
-        
-        {/* Traveled path (line from start to current position) */}
-        {simulationState.currentPosition && waypoints.length > 0 && (
-          <Polyline
-            positions={[
-              [waypoints[0].latitude, waypoints[0].longitude],
-              [simulationState.currentPosition.lat, simulationState.currentPosition.lng]
-            ]}
-            color="#4caf50"
-            weight={4}
-            opacity={0.8}
-          />
-        )}
-      </MapContainer>
-    );
   };
 
   return (
@@ -745,7 +814,62 @@ const MissionExecution: React.FC = () => {
                 <Typography variant="h6" gutterBottom>
                   Flight Path
                 </Typography>
-                <MapView />
+                {selectedMission && field && selectedMission.waypoints && selectedMission.waypoints.length > 0 ? (
+                  <MapContainer
+                    center={[
+                      selectedMission.waypoints.reduce((sum, wp) => sum + wp.latitude, 0) / selectedMission.waypoints.length,
+                      selectedMission.waypoints.reduce((sum, wp) => sum + wp.longitude, 0) / selectedMission.waypoints.length
+                    ]}
+                    zoom={16}
+                    style={{ height: '500px', width: '100%' }}
+                    scrollWheelZoom={true}
+                    dragging={true}
+                    zoomControl={true}
+                  >
+                    <FitBoundsToWaypoints waypoints={selectedMission.waypoints} />
+                    <DroneUpdater 
+                      waypoints={selectedMission.waypoints}
+                      currentPosition={simulationState.currentPosition}
+                      currentWaypointIndex={simulationState.currentWaypointIndex}
+                      progress={simulationState.progress}
+                    />
+                    <TileLayer
+                      url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+                      attribution='&copy; OpenStreetMap contributors'
+                    />
+                    
+                    {/* Field boundary */}
+                    {field.polygon_coordinates && (
+                      <GeoJSON
+                        key={`field-${selectedMission.id}`}
+                        data={field.polygon_coordinates as any}
+                        style={{ color: '#2e7d2e', weight: 2, fillOpacity: 0.2 }}
+                      />
+                    )}
+                    
+                    {/* Flight path */}
+                    <Polyline
+                      key={`path-${selectedMission.id}`}
+                      positions={selectedMission.waypoints.map(wp => [wp.latitude, wp.longitude] as [number, number])}
+                      color="#ff6b35"
+                      weight={3}
+                      opacity={0.7}
+                    />
+                    
+                    {/* Waypoint markers - static, don't change during simulation */}
+                    {selectedMission.waypoints.map((waypoint, index) => (
+                      <Marker
+                        key={`waypoint-${waypoint.id}`}
+                        position={[waypoint.latitude, waypoint.longitude]}
+                        icon={createWaypointIcon(index + 1, false)}
+                      />
+                    ))}
+                  </MapContainer>
+                ) : (
+                  <Box sx={{ height: '500px', display: 'flex', alignItems: 'center', justifyContent: 'center', bgcolor: '#f5f5f5' }}>
+                    <Typography color="text.secondary">No mission selected or mission has no waypoints</Typography>
+                  </Box>
+                )}
               </Paper>
             </Grid>
 
@@ -776,7 +900,6 @@ const MissionExecution: React.FC = () => {
                         </CardContent>
                       </Card>
                     </Grid>
-                    
                     <Grid item xs={6}>
                       <Card variant="outlined">
                         <CardContent sx={{ p: 2, '&:last-child': { pb: 2 } }}>
@@ -802,7 +925,7 @@ const MissionExecution: React.FC = () => {
                             <Typography variant="body2">Battery</Typography>
                           </Box>
                           <Typography variant="body2" fontFamily="monospace">
-                            {simulationState.telemetry.battery_percent.toFixed(1)}%
+                            {simulationState.telemetry.battery_percent}%
                           </Typography>
                           <LinearProgress 
                             variant="determinate" 
