@@ -294,6 +294,8 @@ const MissionExecution: React.FC = () => {
   const [showLogs, setShowLogs] = useState(false);
   const wsRef = useRef<TelemetryWebSocket | null>(null);
   const simulationIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const lastTelemetrySentRef = useRef<number>(0);
+  const TELEMETRY_SEND_INTERVAL = 1000; // Send telemetry every 1 second
 
   // Helper functions for smooth movement
   const calculateDistance = (lat1: number, lng1: number, lat2: number, lng2: number): number => {
@@ -416,6 +418,9 @@ const MissionExecution: React.FC = () => {
       // Start mission via API
       await missionsAPI.startMission(selectedMission.id);
       
+      // 🔄 REFRESH MISSION STATUS AFTER STARTING
+      await loadMissionDetails(selectedMission.id);
+      
       // Connect to WebSocket for real telemetry (if available)
       try {
         wsRef.current = new TelemetryWebSocket(selectedMission.id);
@@ -431,6 +436,10 @@ const MissionExecution: React.FC = () => {
 
         wsRef.current.onMissionUpdate((data) => {
           addLog(`Mission update: ${data.message || data.status}`);
+          // 🔄 REFRESH MISSION STATUS ON UPDATES
+          if (data.status === 'completed') {
+            loadMissionDetails(selectedMission.id);
+          }
         });
       } catch (wsError) {
         console.warn('WebSocket connection failed, using simulation fallback');
@@ -632,6 +641,22 @@ const MissionExecution: React.FC = () => {
             clearInterval(simulationIntervalRef.current);
             simulationIntervalRef.current = null;
           }
+          
+          // � UPDATE BACKEND WITH COMPLETION PROGRESS
+          try {
+            missionsAPI.updateMissionState(selectedMission.id, {
+              progress: 100,
+              current_waypoint_index: currentWaypointIndex,
+              distance_traveled: cumulativeDistance
+            });
+          } catch (error) {
+            console.warn('Failed to update mission progress in backend:', error);
+          }
+          
+          // �🔄 REFRESH MISSION STATUS WHEN SIMULATION COMPLETES
+          setTimeout(() => {
+            loadMissionDetails(selectedMission.id);
+          }, 1000); // Small delay to ensure backend processes completion
         }
 
         // Generate realistic telemetry
@@ -646,6 +671,30 @@ const MissionExecution: React.FC = () => {
           targetPosition.lng
         ) : 0;
 
+        const telemetryData = {
+          mission_id: selectedMission.id,
+          timestamp: new Date().toISOString(),
+          latitude: currentPosition?.lat ?? 0,
+          longitude: currentPosition?.lng ?? 0,
+          altitude_m: currentWaypoint.altitude_m + (Math.random() - 0.5) * 0.5,
+          speed_ms: speed + (Math.random() - 0.5) * 0.5,
+          battery_percent: Math.round(currentBattery),
+          heading_deg: heading + (Math.random() - 0.5) * 5,
+          roll_deg: (Math.random() - 0.5) * 3,
+          pitch_deg: (Math.random() - 0.5) * 3,
+          yaw_deg: heading + (Math.random() - 0.5) * 2,
+          gps_fix_type: 3,
+          satellites_visible: 8 + Math.floor(Math.random() * 4),
+        };
+
+        // Send telemetry to backend via WebSocket for storage (throttled)
+        const now = Date.now();
+        if (wsRef.current && wsRef.current.isConnected() && 
+            (now - lastTelemetrySentRef.current) >= TELEMETRY_SEND_INTERVAL) {
+          wsRef.current.sendTelemetry(telemetryData);
+          lastTelemetrySentRef.current = now;
+        }
+
         return {
           ...prev,
           currentPosition,
@@ -656,21 +705,7 @@ const MissionExecution: React.FC = () => {
           isRunning,
           distanceTraveled: cumulativeDistance,
           progress,
-          telemetry: {
-            mission_id: selectedMission.id,
-            timestamp: new Date().toISOString(),
-            latitude: currentPosition?.lat ?? 0,
-            longitude: currentPosition?.lng ?? 0,
-            altitude_m: currentWaypoint.altitude_m + (Math.random() - 0.5) * 0.5,
-            speed_ms: speed + (Math.random() - 0.5) * 0.5,
-            battery_percent: Math.round(currentBattery),
-            heading_deg: heading + (Math.random() - 0.5) * 5,
-            roll_deg: (Math.random() - 0.5) * 3,
-            pitch_deg: (Math.random() - 0.5) * 3,
-            yaw_deg: heading + (Math.random() - 0.5) * 2,
-            gps_fix_type: 3,
-            satellites_visible: 8 + Math.floor(Math.random() * 4),
-          },
+          telemetry: telemetryData,
         };
       });
     }, 100); // Update every 100ms for smooth movement
@@ -884,7 +919,7 @@ const MissionExecution: React.FC = () => {
                     ))}
                   </MapContainer>
                 ) : (
-                  <Box sx={{ height: '500px', display: 'flex', alignItems: 'center', justifyContent: 'center', bgcolor: '#f5f5f5' }}>
+                  <Box sx={{ height: '500px', display: 'flex', alignItems: 'center', justifyContent: 'center', bgcolor: 'var(--bg-secondary)' }}>
                     <Typography color="text.secondary">No mission selected or mission has no waypoints</Typography>
                   </Box>
                 )}

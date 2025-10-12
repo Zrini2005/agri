@@ -10,3 +10,5 @@ backend/__pycache__/
 /frontend/node_modules
 /frontend/build
 /frontend/.cache
+/backend/agriculture_gcs.db.backup
+/backend/agriculture_gcs.db.backup_20251012_115828
