@@ -155,6 +155,13 @@ export class TelemetryWebSocket {
     this.ws.on('message', callback);
   }
 
+  sendTelemetry(telemetryData: any): void {
+    this.ws.send({
+      type: 'telemetry',
+      data: telemetryData
+    });
+  }
+
   disconnect(): void {
     this.ws.disconnect();
   }

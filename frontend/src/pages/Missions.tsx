@@ -518,14 +518,28 @@ const MissionsPage: React.FC = () => {
         missionsAPI.getMissions(),
         fieldsAPI.getFields()
       ]);
-      const fullMissions = missionsData.map(summary => ({
-        ...summary,
-        altitude_m: 30,
-        speed_ms: 5,
-        field_id: 0,
-        owner_id: 0,
-        waypoints: []
-      }));
+      
+      // Fetch full details for each mission
+      const fullMissions = await Promise.all(
+        missionsData.map(async (summary) => {
+          try {
+            const fullMission = await missionsAPI.getMission(summary.id);
+            return fullMission;
+          } catch (error) {
+            console.error(`Failed to load details for mission ${summary.id}:`, error);
+            // Fallback to summary data with defaults if full details can't be loaded
+            return {
+              ...summary,
+              altitude_m: 30,
+              speed_ms: 5,
+              field_id: 0,
+              owner_id: 0,
+              waypoints: []
+            };
+          }
+        })
+      );
+      
       setMissions(fullMissions);
       setFields(fieldsData);
       
@@ -651,7 +665,7 @@ const MissionsPage: React.FC = () => {
   }
 
   return (
-    <Box sx={{ p: 3, backgroundColor: '#f5f5f5', minHeight: '100vh' }}>
+    <Box sx={{ p: 3, backgroundColor: 'transparent', minHeight: '100vh' }}>
       <Box sx={{ maxWidth: 1200, margin: '0 auto' }}>
         {/* Header Section */}
         <Box 
@@ -662,10 +676,11 @@ const MissionsPage: React.FC = () => {
             alignItems: { xs: 'stretch', md: 'center' },
             mb: 4,
             gap: 2,
-            backgroundColor: 'white',
+            backgroundColor: 'var(--bg-card)',
+            border: '1px solid var(--border-primary)',
             p: 3,
             borderRadius: 2,
-            boxShadow: 1
+            boxShadow: '0 4px 12px rgba(0, 0, 0, 0.5)'
           }}
         >
           <Box>

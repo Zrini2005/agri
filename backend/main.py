@@ -425,10 +425,52 @@ async def update_mission_state(
     ).first()
     if not mission:
         raise HTTPException(status_code=404, detail="Mission not found")
+    
     # Update simulation state fields
     for key in ["current_waypoint_index", "distance_traveled", "progress", "simulation_state"]:
         if key in state_update:
             setattr(mission, key, state_update[key])
+    
+    # 🎯 AUTO-COMPLETE MISSION WHEN PROGRESS REACHES 100%
+    if (mission.progress is not None and 
+        mission.progress >= 100.0 and 
+        mission.status == "running"):
+        
+        mission.status = "completed"
+        if not mission.completed_at:
+            mission.completed_at = datetime.utcnow()
+        
+        # Log completion
+        log_entry = MissionLog(
+            mission_id=mission.id,
+            log_level="INFO",
+            message=f"Mission completed automatically (progress reached {mission.progress}%)",
+            data={"progress": mission.progress, "auto_completed": True, "triggered_by": "state_update"}
+        )
+        db.add(log_entry)
+        print(f"🎉 MISSION {mission_id} AUTO-COMPLETED! Progress: {mission.progress}%")
+    
+    # Alternative check: if all waypoints completed
+    total_waypoints = db.query(Waypoint).filter(Waypoint.mission_id == mission_id).count()
+    if (mission.current_waypoint_index is not None and 
+        total_waypoints > 0 and 
+        mission.current_waypoint_index >= total_waypoints and
+        mission.status == "running"):
+        
+        mission.status = "completed"
+        if not mission.completed_at:
+            mission.completed_at = datetime.utcnow()
+        
+        # Log completion
+        log_entry = MissionLog(
+            mission_id=mission.id,
+            log_level="INFO",
+            message=f"Mission completed automatically (waypoint {mission.current_waypoint_index}/{total_waypoints} reached)",
+            data={"current_waypoint": mission.current_waypoint_index, "total_waypoints": total_waypoints, "auto_completed": True, "triggered_by": "state_update"}
+        )
+        db.add(log_entry)
+        print(f"🎉 MISSION {mission_id} AUTO-COMPLETED! Waypoints: {mission.current_waypoint_index}/{total_waypoints}")
+    
     db.commit()
     db.refresh(mission)
     return mission
@@ -484,6 +526,73 @@ async def delete_mission(
 
 
 # Mission control endpoints
+@app.post("/missions/{mission_id}/force-complete")
+async def force_complete_mission(
+    mission_id: int,
+    current_user: DBUser = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Force complete a mission that has 100% progress but wrong status."""
+    mission = db.query(Mission).filter(
+        Mission.id == mission_id, Mission.owner_id == current_user.id
+    ).first()
+    if not mission:
+        raise HTTPException(status_code=404, detail="Mission not found")
+    
+    # Force complete regardless of current status
+    old_status = mission.status
+    mission.status = "completed"
+    mission.completed_at = datetime.utcnow()
+    if mission.progress is None:
+        mission.progress = 100.0
+    
+    # Log forced completion
+    log_entry = MissionLog(
+        mission_id=mission.id,
+        log_level="INFO",
+        message=f"Mission force-completed (was {old_status}, progress: {mission.progress}%)",
+        data={"old_status": old_status, "progress": mission.progress, "force_completed": True}
+    )
+    db.add(log_entry)
+    db.commit()
+    
+    return {"message": f"Mission {mission_id} force-completed (was {old_status})"}
+
+
+@app.post("/missions/{mission_id}/complete")
+async def complete_mission(
+    mission_id: int,
+    current_user: DBUser = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Manually complete a mission (for testing)."""
+    mission = db.query(Mission).filter(
+        Mission.id == mission_id, Mission.owner_id == current_user.id
+    ).first()
+    if not mission:
+        raise HTTPException(status_code=404, detail="Mission not found")
+    
+    if mission.status not in ["running", "paused"]:
+        raise HTTPException(status_code=400, detail="Mission is not running or paused")
+    
+    mission.status = "completed"
+    mission.completed_at = datetime.utcnow()
+    mission.progress = 100.0
+    db.commit()
+    
+    # Log completion
+    log_entry = MissionLog(
+        mission_id=mission.id,
+        log_level="INFO",
+        message="Mission completed manually",
+        data={"manual_completion": True}
+    )
+    db.add(log_entry)
+    db.commit()
+    
+    return {"message": "Mission completed successfully"}
+
+
 @app.post("/missions/{mission_id}/start")
 async def start_mission(
     mission_id: int,
@@ -783,11 +892,36 @@ async def predict_battery_drain(
 @app.websocket("/ws/telemetry/{mission_id}")
 async def websocket_telemetry(websocket: WebSocket, mission_id: int):
     """WebSocket endpoint for real-time telemetry."""
+    import logging
+    logger = logging.getLogger("telemetry_ws")
+    
     await websocket_manager.connect_telemetry(websocket, mission_id)
     try:
         while True:
-            # Keep connection alive
-            await asyncio.sleep(1)
+            try:
+                # Receive messages from client
+                data = await asyncio.wait_for(websocket.receive_text(), timeout=1.0)
+                message = json.loads(data)
+                
+                # Handle telemetry data from client
+                if message.get("type") == "telemetry":
+                    telemetry_data = message.get("data", {})
+                    
+                    # Ensure mission_id is set
+                    telemetry_data["mission_id"] = mission_id
+                    
+                    # Store telemetry using existing handler
+                    await handle_telemetry_update(telemetry_data)
+                    
+                    # Broadcast to other connected clients
+                    await websocket_manager.broadcast_telemetry(mission_id, telemetry_data)
+                    
+            except asyncio.TimeoutError:
+                # No message received, keep connection alive
+                continue
+            except Exception as e:
+                logger.error(f"Error processing telemetry message: {e}")
+                break
     except WebSocketDisconnect:
         websocket_manager.disconnect_telemetry(websocket, mission_id)
 
@@ -814,6 +948,9 @@ async def websocket_simulator(websocket: WebSocket):
             elif message.get("type") == "mission_complete":
                 logger.info(f"Mission complete message received: {message['data']}")
                 await handle_mission_complete(message["data"])
+            elif message.get("type") == "mission_status":
+                logger.info(f"Mission status message received: {message['data']}")
+                await handle_mission_status_update(message["data"])
     except WebSocketDisconnect:
         logger.warning("Simulator WebSocket disconnected")
         websocket_manager.disconnect_simulator(websocket)
@@ -856,6 +993,50 @@ async def handle_telemetry_update(telemetry_data: dict):
             )
             db.add(insight)
             db.commit()
+        
+        # AUTO-COMPLETE MISSION WHEN PROGRESS REACHES 100%
+        mission_id = telemetry_data.get("mission_id")
+        if mission_id:
+            mission = db.query(Mission).filter(Mission.id == mission_id).first()
+            if mission and mission.status == "running":
+                # Check if progress reaches 100%
+                if mission.progress is not None and mission.progress >= 100.0:
+                    mission.status = "completed"
+                    if not mission.completed_at:
+                        mission.completed_at = datetime.datetime.utcnow()
+                    
+                    # Log completion
+                    log_entry = MissionLog(
+                        mission_id=mission.id,
+                        log_level="INFO",
+                        message="Mission completed automatically (progress reached 100%)",
+                        data={"progress": mission.progress, "auto_completed": True}
+                    )
+                    db.add(log_entry)
+                    db.commit()
+                    logger.info(f"🎉 Mission {mission_id} AUTO-COMPLETED! Progress: {mission.progress}%")
+                
+                # Alternative: Check if all waypoints completed
+                total_waypoints = db.query(Waypoint).filter(Waypoint.mission_id == mission_id).count()
+                if (mission.current_waypoint_index is not None and 
+                    total_waypoints > 0 and 
+                    mission.current_waypoint_index >= total_waypoints):
+                    
+                    mission.status = "completed"
+                    if not mission.completed_at:
+                        mission.completed_at = datetime.datetime.utcnow()
+                    
+                    # Log completion
+                    log_entry = MissionLog(
+                        mission_id=mission.id,
+                        log_level="INFO",
+                        message=f"Mission completed automatically (all waypoints reached: {mission.current_waypoint_index}/{total_waypoints})",
+                        data={"current_waypoint": mission.current_waypoint_index, "total_waypoints": total_waypoints, "auto_completed": True}
+                    )
+                    db.add(log_entry)
+                    db.commit()
+                    logger.info(f"🎉 Mission {mission_id} AUTO-COMPLETED! Waypoints: {mission.current_waypoint_index}/{total_waypoints}")
+        
         # Broadcast to connected clients
         await websocket_manager.broadcast_telemetry(telemetry_data["mission_id"], telemetry_data)
     finally:
@@ -881,6 +1062,64 @@ async def handle_mission_complete(data: dict):
             )
             db.add(log_entry)
             db.commit()
+    finally:
+        db.close()
+
+
+async def handle_mission_status_update(data: dict):
+    """Handle mission status updates from simulator."""
+    import logging
+    logger = logging.getLogger("mission_status")
+    db = SessionLocal()
+    try:
+        mission_id = data.get("mission_id")
+        status = data.get("status")
+        message = data.get("message", "")
+        
+        logger.info(f"Processing mission status update: mission_id={mission_id}, status={status}")
+        
+        mission = db.query(Mission).filter(Mission.id == mission_id).first()
+        if not mission:
+            logger.warning(f"Mission {mission_id} not found")
+            return
+        
+        # Update mission status based on simulator status
+        if status == "completed":
+            mission.status = "completed"
+            if not mission.completed_at:
+                mission.completed_at = datetime.utcnow()
+            logger.info(f"Mission {mission_id} marked as completed")
+            
+            # Log completion
+            log_entry = MissionLog(
+                mission_id=mission.id,
+                log_level="INFO",
+                message=f"Mission completed: {message}",
+                data=data
+            )
+            db.add(log_entry)
+            
+        elif status == "started":
+            if not mission.started_at:
+                mission.started_at = datetime.utcnow()
+            logger.info(f"Mission {mission_id} started")
+            
+        elif status == "waypoint_reached":
+            # Log waypoint progress
+            log_entry = MissionLog(
+                mission_id=mission.id,
+                log_level="INFO",
+                message=message,
+                data=data
+            )
+            db.add(log_entry)
+            
+        db.commit()
+        logger.info(f"Mission status updated successfully")
+        
+    except Exception as e:
+        logger.error(f"Error updating mission status: {e}")
+        db.rollback()
     finally:
         db.close()
 
