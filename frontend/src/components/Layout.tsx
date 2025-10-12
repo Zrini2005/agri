@@ -17,6 +17,7 @@ import {
   Map as MapIcon,
   FlightTakeoff as FlightIcon,
   PlayArrow as ExecuteIcon,
+  Analytics as AnalyticsIcon,
   Assessment as ReportsIcon,
   Logout as LogoutIcon,
 } from '@mui/icons-material';
@@ -35,6 +36,7 @@ const Layout: React.FC = () => {
     { text: 'Fields', icon: <MapIcon />, path: '/fields' },
     { text: 'Missions', icon: <FlightIcon />, path: '/missions' },
     { text: 'Mission Execution', icon: <ExecuteIcon />, path: '/mission-execution' },
+    { text: 'AI Inference', icon: <AnalyticsIcon />, path: '/inference' },
     { text: 'Reports', icon: <ReportsIcon />, path: '/reports' },
   ];
 

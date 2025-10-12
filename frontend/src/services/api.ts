@@ -181,6 +181,33 @@ export const aiAPI = {
   },
 };
 
+// Inference
+export interface InferenceResult {
+  success: boolean;
+  vegetation_percentage: number;
+  original_image: string;
+  mask_image: string;
+  overlay_image: string;
+  original_path: string;
+  mask_path: string;
+  overlay_path: string;
+  timestamp: string;
+}
+
+export const inferenceAPI = {
+  analyzeImage: async (file: File): Promise<InferenceResult> => {
+    const formData = new FormData();
+    formData.append('file', file);
+    
+    const response: AxiosResponse<InferenceResult> = await api.post('/inference/analyze', formData, {
+      headers: {
+        'Content-Type': 'multipart/form-data',
+      },
+    });
+    return response.data;
+  },
+};
+
 // Health check
 export const healthAPI = {
   check: async (): Promise<{ status: string; timestamp: string }> => {
