@@ -1,3 +1,90 @@
+from typing import Optional
+from fastapi import FastAPI, Depends, HTTPException, status, WebSocket, WebSocketDisconnect, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from sqlalchemy.orm import Session
+from datetime import datetime, timedelta
+from typing import List, Dict, Any, Optional
+import json
+import asyncio
+import csv
+import io
+import tempfile
+import os
+import base64
+import numpy as np
+from PIL import Image
+from database import (
+    create_tables,
+    get_db,
+    SessionLocal,
+    User as DBUser,
+    Field as DBField,
+    Mission as DBMission,
+    Waypoint as DBWaypoint,
+    TelemetryLog as DBTelemetryLog,
+    MissionLog as DBMissionLog,
+    AIInsight as DBAIInsight,
+    InferenceImage,
+)
+import schemas
+from auth import (
+    authenticate_user, create_access_token, get_current_active_user, 
+    get_password_hash, get_admin_user
+)
+from config import settings
+try:
+    from ai_service import AIService
+except Exception:
+    # Provide a lightweight fallback AIService when heavy ML deps are missing
+    class AIService:
+        def __init__(self):
+            self.is_trained = False
+
+        async def predict_battery_drain(self, telemetry_history):
+            return {"error": "ML dependencies not installed", "confidence": 0.0}
+
+        async def detect_anomaly(self, telemetry_data):
+            # Simple rule-based fallback
+            return {
+                "is_anomaly": False,
+                "confidence": 0.0,
+                "message": "Fallback AI - no ML available",
+                "timestamp": datetime.utcnow().isoformat()
+            }
+from websocket_manager import WebSocketManager
+
+# Create FastAPI app
+app = FastAPI(
+    title="Agriculture Drone GCS API",
+    description="Ground Control Station API for agricultural drones",
+    version="1.0.0"
+)
+
+# Endpoint to fetch inference images for a user (optionally filtered by user or all)
+@app.get("/inference/images")
+async def get_inference_images(
+    user_id: Optional[int] = None,
+    db: Session = Depends(get_db),
+    current_user: schemas.User = Depends(get_current_active_user)
+):
+    query = db.query(InferenceImage)
+    if user_id:
+        query = query.filter(InferenceImage.user_id == user_id)
+    images = query.order_by(InferenceImage.timestamp.desc()).all()
+    return [
+        {
+            "id": img.id,
+            "user_id": img.user_id,
+            "mission_id": img.mission_id,
+            "timestamp": img.timestamp,
+            "vegetation_percentage": img.vegetation_percentage,
+            "original_path": img.original_path,
+            "mask_path": img.mask_path,
+            "overlay_path": img.overlay_path,
+        }
+        for img in images
+    ]
 from fastapi import FastAPI, Depends, HTTPException, status, WebSocket, WebSocketDisconnect, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -25,6 +112,7 @@ from database import (
     TelemetryLog as DBTelemetryLog,
     MissionLog as DBMissionLog,
     AIInsight as DBAIInsight,
+    InferenceImage,
 )
 import schemas
 from auth import (
@@ -308,18 +396,41 @@ async def create_mission(
     return db_mission
 
 
+
 @app.get("/missions/{mission_id}", response_model=schemas.Mission)
 async def get_mission(
     mission_id: int,
     current_user: DBUser = Depends(get_current_active_user),
     db: Session = Depends(get_db)
 ):
-    """Get mission by ID."""
+    """Get mission by ID, including simulation state."""
     mission = db.query(Mission).filter(
         Mission.id == mission_id, Mission.owner_id == current_user.id
     ).first()
     if not mission:
         raise HTTPException(status_code=404, detail="Mission not found")
+    # Simulation state fields are now included in the Mission model
+    return mission
+
+@app.patch("/missions/{mission_id}/state", response_model=schemas.Mission)
+async def update_mission_state(
+    mission_id: int,
+    state_update: dict,
+    current_user: DBUser = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Update simulation state for a mission (pause/resume persistence)."""
+    mission = db.query(Mission).filter(
+        Mission.id == mission_id, Mission.owner_id == current_user.id
+    ).first()
+    if not mission:
+        raise HTTPException(status_code=404, detail="Mission not found")
+    # Update simulation state fields
+    for key in ["current_waypoint_index", "distance_traveled", "progress", "simulation_state"]:
+        if key in state_update:
+            setattr(mission, key, state_update[key])
+    db.commit()
+    db.refresh(mission)
     return mission
 
 
@@ -365,8 +476,7 @@ async def delete_mission(
     if not mission:
         raise HTTPException(status_code=404, detail="Mission not found")
     
-    if mission.status == "running":
-        raise HTTPException(status_code=400, detail="Cannot delete running mission")
+    # Allow deletion of running missions
     
     db.delete(mission)
     db.commit()
@@ -682,35 +792,57 @@ async def websocket_telemetry(websocket: WebSocket, mission_id: int):
         websocket_manager.disconnect_telemetry(websocket, mission_id)
 
 
+
 # WebSocket endpoint for simulator commands
 @app.websocket("/ws/simulator")
 async def websocket_simulator(websocket: WebSocket):
     """WebSocket endpoint for simulator communication."""
+    import logging
+    logger = logging.getLogger("simulator_ws")
+    logger.info("Simulator WebSocket connection attempt")
     await websocket_manager.connect_simulator(websocket)
+    logger.info("Simulator WebSocket connected")
     try:
         while True:
             data = await websocket.receive_text()
+            logger.info(f"Received from simulator: {data}")
             message = json.loads(data)
-            
             # Process telemetry data
             if message.get("type") == "telemetry":
+                logger.info(f"Telemetry message received: {message['data']}")
                 await handle_telemetry_update(message["data"])
             elif message.get("type") == "mission_complete":
+                logger.info(f"Mission complete message received: {message['data']}")
                 await handle_mission_complete(message["data"])
-                
     except WebSocketDisconnect:
+        logger.warning("Simulator WebSocket disconnected")
         websocket_manager.disconnect_simulator(websocket)
 
 
 async def handle_telemetry_update(telemetry_data: dict):
     """Handle incoming telemetry data."""
-    # Save to database
+    import logging
+    logger = logging.getLogger("telemetry")
+    logger.info(f"Received telemetry data: {telemetry_data}")
     db = SessionLocal()
     try:
-        telemetry = TelemetryLog(**telemetry_data)
-        db.add(telemetry)
-        db.commit()
-        
+        # Parse timestamp if present and is a string
+        import datetime
+        td = telemetry_data.copy()
+        ts = td.get("timestamp")
+        if isinstance(ts, str):
+            try:
+                td["timestamp"] = datetime.datetime.fromisoformat(ts)
+            except Exception as e:
+                logger.error(f"Failed to parse timestamp: {ts}, error: {e}")
+                td["timestamp"] = datetime.datetime.utcnow()
+        try:
+            telemetry = TelemetryLog(**td)
+            db.add(telemetry)
+            db.commit()
+            logger.info(f"Telemetry stored in DB: {td}")
+        except Exception as e:
+            logger.error(f"Failed to store telemetry in DB: {td}, error: {e}")
         # Check for anomalies
         anomaly_result = await ai_service.detect_anomaly(telemetry_data)
         if anomaly_result["is_anomaly"]:
@@ -724,10 +856,8 @@ async def handle_telemetry_update(telemetry_data: dict):
             )
             db.add(insight)
             db.commit()
-        
         # Broadcast to connected clients
         await websocket_manager.broadcast_telemetry(telemetry_data["mission_id"], telemetry_data)
-        
     finally:
         db.close()
 
@@ -762,7 +892,8 @@ async def handle_mission_complete(data: dict):
 @app.post("/inference/analyze")
 async def analyze_image(
     file: UploadFile = File(...),
-    current_user: schemas.User = Depends(get_current_active_user)
+    current_user: schemas.User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
 ):
     """
     Upload an image and run vegetation segmentation inference.
@@ -848,6 +979,18 @@ async def analyze_image(
         mask_base64 = image_to_base64(mask_filepath)
         overlay_base64 = image_to_base64(overlay_filepath)
         
+        # Save inference image metadata to database
+        inference_image = InferenceImage(
+            user_id=current_user.id if current_user else None,
+            vegetation_percentage=round(vegetation_percentage, 2),
+            original_path=f"/static/uploads/{filename}",
+            mask_path=f"/static/results/{mask_filename}",
+            overlay_path=f"/static/results/{overlay_filename}",
+        )
+        db.add(inference_image)
+        db.commit()
+        db.refresh(inference_image)
+
         return {
             "success": True,
             "vegetation_percentage": round(vegetation_percentage, 2),
@@ -857,7 +1000,8 @@ async def analyze_image(
             "original_path": f"/static/uploads/{filename}",
             "mask_path": f"/static/results/{mask_filename}",
             "overlay_path": f"/static/results/{overlay_filename}",
-            "timestamp": datetime.utcnow().isoformat()
+            "timestamp": datetime.utcnow().isoformat(),
+            "inference_id": inference_image.id
         }
         
     except Exception as e:

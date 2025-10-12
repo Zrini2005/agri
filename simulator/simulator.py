@@ -99,19 +99,22 @@ class DroneSimulator:
         self.altitude_noise_std = 0.5  # Altitude noise in meters
         
     async def connect_to_backend(self):
-        """Connect to the backend WebSocket."""
-        # If no backend_url is set (falsy), skip attempting to connect.
+        """
+        Connect to the backend WebSocket. If connection fails, retry every 5 seconds.
+        This simulator NEVER writes directly to the database. All telemetry is sent to the backend via WebSocket.
+        """
         if not self.backend_url:
             logger.info("No backend URL configured; running in standalone mode")
             return False
 
-        try:
-            self.websocket = await websockets.connect(self.backend_url)
-            logger.info(f"Connected to backend at {self.backend_url}")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to connect to backend: {e}")
-            return False
+        while True:
+            try:
+                self.websocket = await websockets.connect(self.backend_url)
+                logger.info(f"Connected to backend at {self.backend_url}")
+                return True
+            except Exception as e:
+                logger.error(f"Failed to connect to backend: {e}. Retrying in 5 seconds...")
+                await asyncio.sleep(5)
     
     async def disconnect_from_backend(self):
         """Disconnect from backend WebSocket."""
@@ -518,31 +521,35 @@ class DroneSimulator:
                 await asyncio.sleep(1)  # Prevent rapid error loops
     
     async def run(self):
-        """Main entry point for the simulator."""
+        """
+        Main entry point for the simulator. Will keep trying to connect to backend if disconnected.
+        """
         logger.info("Starting drone simulator...")
-        
-        # Connect to backend
-        if not await self.connect_to_backend():
-            logger.error("Failed to connect to backend, running in standalone mode")
-        
-        # Start tasks
-        tasks = [
-            asyncio.create_task(self.run_simulation_loop()),
-        ]
-        
-        if self.websocket:
-            tasks.append(asyncio.create_task(self.listen_for_commands()))
-        
-        try:
-            # Run all tasks concurrently
-            await asyncio.gather(*tasks)
-        except KeyboardInterrupt:
-            logger.info("Simulator stopped by user")
-        except Exception as e:
-            logger.error(f"Simulator error: {e}")
-        finally:
-            self.running = False
-            await self.disconnect_from_backend()
+        while True:
+            connected = await self.connect_to_backend()
+            if not connected:
+                logger.error("Could not connect to backend. Retrying...")
+                await asyncio.sleep(5)
+                continue
+
+            # Start tasks
+            tasks = [
+                asyncio.create_task(self.run_simulation_loop()),
+            ]
+            if self.websocket:
+                tasks.append(asyncio.create_task(self.listen_for_commands()))
+            try:
+                await asyncio.gather(*tasks)
+            except KeyboardInterrupt:
+                logger.info("Simulator stopped by user")
+                break
+            except Exception as e:
+                logger.error(f"Simulator error: {e}")
+            finally:
+                self.running = False
+                await self.disconnect_from_backend()
+                logger.info("Reconnecting to backend in 5 seconds...")
+                await asyncio.sleep(5)
 
 
 async def main():

@@ -11,8 +11,18 @@ import {
   RegisterData,
   Token,
   FieldCreate,
-  MissionCreate
+  MissionCreate,
+  InferenceImage
 } from '../types';
+
+// Inference Images
+export const inferenceImagesAPI = {
+  getImages: async (userId?: number): Promise<InferenceImage[]> => {
+    const params = userId ? `?user_id=${userId}` : '';
+    const response: AxiosResponse<InferenceImage[]> = await api.get(`/inference/images${params}`);
+    return response.data;
+  },
+};
 
 const API_BASE_URL = process.env.REACT_APP_API_BASE_URL || 'http://localhost:8000';
 
@@ -102,6 +112,11 @@ export const missionsAPI = {
 
   getMission: async (missionId: number): Promise<Mission> => {
     const response: AxiosResponse<Mission> = await api.get(`/missions/${missionId}`);
+    return response.data;
+  },
+
+  updateMissionState: async (missionId: number, state: Partial<Mission>): Promise<Mission> => {
+    const response: AxiosResponse<Mission> = await api.patch(`/missions/${missionId}/state`, state);
     return response.data;
   },
 
