@@ -10,6 +10,7 @@ import Dashboard from './pages/Dashboard';
 import Fields from './pages/Fields';
 import Missions from './pages/Missions';
 import MissionExecution from './pages/MissionExecution';
+import Inference from './pages/Inference';
 import Reports from './pages/Reports';
 import './App.css';
 
@@ -65,6 +66,7 @@ const AppRoutes: React.FC = () => {
         <Route path="missions" element={<Missions />} />
         <Route path="mission-execution" element={<MissionExecution />} />
         <Route path="missions/:missionId/execute" element={<MissionExecution />} />
+        <Route path="inference" element={<Inference />} />
         <Route path="reports" element={<Reports />} />
       </Route>
       <Route path="*" element={<Navigate to="/dashboard" replace />} />

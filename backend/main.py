@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, status, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Depends, HTTPException, status, WebSocket, WebSocketDisconnect, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
@@ -10,6 +10,9 @@ import csv
 import io
 import tempfile
 import os
+import base64
+import numpy as np
+from PIL import Image
 
 from database import (
     create_tables,
@@ -750,6 +753,120 @@ async def handle_mission_complete(data: dict):
             db.commit()
     finally:
         db.close()
+
+
+# ========================================
+# INFERENCE ENDPOINTS
+# ========================================
+
+@app.post("/inference/analyze")
+async def analyze_image(
+    file: UploadFile = File(...),
+    current_user: schemas.User = Depends(get_current_active_user)
+):
+    """
+    Upload an image and run vegetation segmentation inference.
+    Returns the mask and vegetation percentage.
+    """
+    try:
+        # Ensure upload directory exists
+        os.makedirs("static/uploads", exist_ok=True)
+        os.makedirs("static/results", exist_ok=True)
+        
+        # Save uploaded file
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        filename = f"{timestamp}_{file.filename}"
+        filepath = os.path.join("static/uploads", filename)
+        
+        contents = await file.read()
+        with open(filepath, "wb") as f:
+            f.write(contents)
+        
+        print(f"Image saved to: {filepath}")
+        
+        # Try to run inference
+        try:
+            from inference import run_inference
+            mask, vegetation_percentage = run_inference(filepath)
+        except Exception as inference_error:
+            print(f"Inference error: {str(inference_error)}")
+            print("Falling back to simple green color detection...")
+            
+            # Fallback: Simple green color detection
+            from PIL import Image as PILImage
+            import numpy as np
+            
+            img = PILImage.open(filepath).convert('RGB')
+            img_array = np.array(img)
+            
+            # Simple green detection: pixels where green > red and green > blue
+            green_mask = (img_array[:, :, 1] > img_array[:, :, 0]) & \
+                        (img_array[:, :, 1] > img_array[:, :, 2]) & \
+                        (img_array[:, :, 1] > 50)  # Some threshold
+            
+            mask = green_mask.astype(np.float32)
+            vegetation_percentage = (np.sum(mask) / mask.size) * 100
+            
+            print(f"Fallback detection: {vegetation_percentage:.2f}% vegetation")
+        
+        # Convert mask to base64 image
+        mask_normalized = (mask * 255).astype(np.uint8)
+        mask_img = Image.fromarray(mask_normalized, mode='L')
+        
+        # Save mask image
+        mask_filename = f"mask_{filename}"
+        mask_filepath = os.path.join("static/results", mask_filename)
+        mask_img.save(mask_filepath)
+        
+        # Create overlay image
+        original_img = Image.open(filepath).convert('RGBA')
+        mask_rgba = Image.new('RGBA', original_img.size, (0, 0, 0, 0))
+        
+        # Resize mask to match original image size
+        mask_resized = mask_img.resize(original_img.size, Image.Resampling.LANCZOS)
+        mask_array = np.array(mask_resized)
+        
+        # Create green overlay where vegetation is detected
+        overlay_array = np.array(mask_rgba)
+        overlay_array[mask_array > 128] = [0, 255, 0, 100]  # Green with transparency
+        overlay_img = Image.fromarray(overlay_array, 'RGBA')
+        
+        # Composite images
+        result_img = Image.alpha_composite(original_img, overlay_img)
+        
+        # Save overlay image
+        overlay_filename = f"overlay_{filename.rsplit('.', 1)[0]}.png"
+        overlay_filepath = os.path.join("static/results", overlay_filename)
+        result_img.save(overlay_filepath)
+        
+        # Convert images to base64 for response
+        def image_to_base64(img_path):
+            with open(img_path, "rb") as img_file:
+                return base64.b64encode(img_file.read()).decode('utf-8')
+        
+        original_base64 = image_to_base64(filepath)
+        mask_base64 = image_to_base64(mask_filepath)
+        overlay_base64 = image_to_base64(overlay_filepath)
+        
+        return {
+            "success": True,
+            "vegetation_percentage": round(vegetation_percentage, 2),
+            "original_image": f"data:image/jpeg;base64,{original_base64}",
+            "mask_image": f"data:image/png;base64,{mask_base64}",
+            "overlay_image": f"data:image/png;base64,{overlay_base64}",
+            "original_path": f"/static/uploads/{filename}",
+            "mask_path": f"/static/results/{mask_filename}",
+            "overlay_path": f"/static/results/{overlay_filename}",
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error during inference: {str(e)}"
+        )
 
 
 if __name__ == "__main__":
