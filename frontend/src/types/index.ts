@@ -1,3 +1,13 @@
+export interface InferenceImage {
+  id: number;
+  user_id: number;
+  mission_id?: number;
+  timestamp: string;
+  vegetation_percentage: number;
+  original_path: string;
+  mask_path: string;
+  overlay_path: string;
+}
 export interface User {
   id: number;
   username: string;
@@ -49,6 +59,10 @@ export interface Mission {
   started_at?: string;
   completed_at?: string;
   waypoints: Waypoint[];
+  current_waypoint_index?: number;
+  distance_traveled?: number;
+  progress?: number;
+  simulation_state?: any;
 }
 
 export interface MissionSummary {

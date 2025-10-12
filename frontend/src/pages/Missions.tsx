@@ -802,39 +802,6 @@ const MissionsPage: React.FC = () => {
                   >
                     View Details
                   </Button>
-                  {mission.status === 'planned' && (
-                    <Button
-                      size="small"
-                      color="primary"
-                      startIcon={<StartIcon />}
-                      onClick={() => handleStartMission(mission.id)}
-                      sx={{ minWidth: '100px' }}
-                    >
-                      Start
-                    </Button>
-                  )}
-                  {mission.status === 'running' && (
-                    <>
-                      <Button
-                        size="small"
-                        color="warning"
-                        startIcon={<StopIcon />}
-                        onClick={() => handlePauseMission(mission.id)}
-                        sx={{ minWidth: '100px' }}
-                      >
-                        Pause
-                      </Button>
-                      <Button
-                        size="small"
-                        color="error"
-                        startIcon={<DeleteIcon />}
-                        onClick={() => handleAbortMission(mission.id)}
-                        sx={{ minWidth: '100px' }}
-                      >
-                        Abort
-                      </Button>
-                    </>
-                  )}
                 </Box>
               </Paper>
             </Grid>

@@ -329,6 +329,7 @@ const MissionExecution: React.FC = () => {
 
   const calculateTotalMissionDistance = (waypoints: any[]): number => {
     let total = 0;
+    // Only sum distances from waypoint 1 to n (do NOT include return to waypoint 1)
     for (let i = 1; i < waypoints.length; i++) {
       total += calculateDistance(
         waypoints[i-1].latitude,
@@ -549,98 +550,117 @@ const MissionExecution: React.FC = () => {
     const initialBatteryLevel = 100;
 
     simulationIntervalRef.current = setInterval(() => {
-      setSimulationState(prev => {
+      setSimulationState((prev: SimulationState) => {
         if (!prev.isRunning || !selectedMission) return prev;
 
         const waypoints = selectedMission.waypoints;
         if (waypoints.length === 0) return prev;
 
-        let newState = { ...prev };
-        const speed = selectedMission.speed_ms || 5; // m/s
-        const deltaTime = 0.1; // 100ms updates
-        const distanceStep = speed * deltaTime;
+        let speed = selectedMission.speed_ms || 5; // m/s
+        let deltaTime = 0.1; // 100ms updates
+        let distanceStep = speed * deltaTime;
 
-        // If we have a target position, move towards it
-        if (newState.currentPosition && newState.targetPosition) {
+        let currentPosition = prev.currentPosition;
+        let currentWaypointIndex = prev.currentWaypointIndex;
+        let interpolationProgress = prev.interpolationProgress;
+        let targetPosition = prev.targetPosition;
+        let logs = prev.logs;
+  let isRunning: boolean = prev.isRunning;
+
+        if (currentPosition && targetPosition) {
           const distanceToTarget = calculateDistance(
-            newState.currentPosition.lat,
-            newState.currentPosition.lng,
-            newState.targetPosition.lat,
-            newState.targetPosition.lng
+            currentPosition.lat,
+            currentPosition.lng,
+            targetPosition.lat,
+            targetPosition.lng
           );
 
           if (distanceToTarget < distanceStep) {
-            // Reached current target, move to next waypoint
-            newState.currentPosition = newState.targetPosition;
-            newState.distanceTraveled += distanceToTarget;
-            newState.currentWaypointIndex += 1;
-            newState.interpolationProgress = 0;
-
-            // Set next target or complete mission
-            if (newState.currentWaypointIndex < waypoints.length - 1) {
-              newState.targetPosition = {
-                lat: waypoints[newState.currentWaypointIndex + 1].latitude,
-                lng: waypoints[newState.currentWaypointIndex + 1].longitude
+            currentPosition = targetPosition;
+            currentWaypointIndex += 1;
+            interpolationProgress = 0;
+            if (currentWaypointIndex < waypoints.length - 1) {
+              targetPosition = {
+                lat: waypoints[currentWaypointIndex + 1].latitude,
+                lng: waypoints[currentWaypointIndex + 1].longitude
               };
-              
-              newState.logs = [...prev.logs.slice(-50), 
-                `Reached waypoint ${newState.currentWaypointIndex + 1}: ${new Date().toLocaleTimeString()}`
-              ];
+              logs = [...logs.slice(-50), `Reached waypoint ${currentWaypointIndex + 1}: ${new Date().toLocaleTimeString()}`];
             } else {
-              // Mission completed
-              newState.targetPosition = null;
-              newState.isRunning = false;
-              newState.progress = 100;
-              newState.distanceTraveled = newState.totalDistance; // Ensure we show 100%
-              newState.logs = [...prev.logs.slice(-50), 
-                `Mission completed: ${new Date().toLocaleTimeString()}`
-              ];
-              
-              if (simulationIntervalRef.current) {
-                clearInterval(simulationIntervalRef.current);
-                simulationIntervalRef.current = null;
-              }
+              targetPosition = null;
             }
           } else {
-            // Smooth interpolation towards target
             const progressStep = distanceStep / distanceToTarget;
-            newState.interpolationProgress = Math.min(1, newState.interpolationProgress + progressStep);
-            
-            const currentWaypoint = waypoints[newState.currentWaypointIndex];
-            const targetWaypoint = waypoints[newState.currentWaypointIndex + 1];
-            
-            newState.currentPosition = interpolatePosition(
+            interpolationProgress = Math.min(1, interpolationProgress + progressStep);
+            const currentWaypoint = waypoints[currentWaypointIndex];
+            const nextWaypoint = waypoints[currentWaypointIndex + 1];
+            currentPosition = interpolatePosition(
               { lat: currentWaypoint.latitude, lng: currentWaypoint.longitude },
-              { lat: targetWaypoint.latitude, lng: targetWaypoint.longitude },
-              newState.interpolationProgress
+              { lat: nextWaypoint.latitude, lng: nextWaypoint.longitude },
+              interpolationProgress
             );
-            
-            newState.distanceTraveled += distanceStep;
           }
+        }
 
-          // Update overall progress (ensure it goes from 0 to 100)
-          if (newState.totalDistance > 0) {
-            newState.progress = Math.min(100, (newState.distanceTraveled / newState.totalDistance) * 100);
+        // Calculate true cumulative distance from start to current position
+        let cumulativeDistance = 0;
+        for (let i = 1; i <= currentWaypointIndex; i++) {
+          cumulativeDistance += calculateDistance(
+            waypoints[i-1].latitude,
+            waypoints[i-1].longitude,
+            waypoints[i].latitude,
+            waypoints[i].longitude
+          );
+        }
+        if (currentWaypointIndex < waypoints.length - 1 && currentPosition) {
+          cumulativeDistance += calculateDistance(
+            waypoints[currentWaypointIndex].latitude,
+            waypoints[currentWaypointIndex].longitude,
+            currentPosition.lat,
+            currentPosition.lng
+          );
+        }
+
+        let progress = Math.min(100, (cumulativeDistance / prev.totalDistance) * 100);
+
+        // Mission complete if reached last waypoint
+        if (currentWaypointIndex >= waypoints.length - 1 && progress >= 100) {
+          progress = 100;
+          isRunning = false;
+          cumulativeDistance = prev.totalDistance;
+          logs = [...logs.slice(-50), `Mission completed: ${new Date().toLocaleTimeString()}`];
+          if (simulationIntervalRef.current) {
+            clearInterval(simulationIntervalRef.current);
+            simulationIntervalRef.current = null;
           }
+        }
 
-          // Generate realistic telemetry
-          const missionDuration = (Date.now() - missionStartTime) / 1000; // seconds
-          const batteryDrainRate = 0.5; // %/minute
-          const currentBattery = Math.max(10, initialBatteryLevel - (missionDuration / 60) * batteryDrainRate);
-          
-          const currentWaypoint = waypoints[newState.currentWaypointIndex];
-          const heading = newState.targetPosition ? calculateBearing(
-            newState.currentPosition.lat,
-            newState.currentPosition.lng,
-            newState.targetPosition.lat,
-            newState.targetPosition.lng
-          ) : 0;
+        // Generate realistic telemetry
+        const missionDuration = (Date.now() - missionStartTime) / 1000; // seconds
+        const batteryDrainRate = 0.5; // %/minute
+        const currentBattery = Math.max(10, initialBatteryLevel - (missionDuration / 60) * batteryDrainRate);
+        const currentWaypoint = waypoints[Math.min(currentWaypointIndex, waypoints.length - 1)];
+        const heading = targetPosition ? calculateBearing(
+          currentPosition?.lat ?? 0,
+          currentPosition?.lng ?? 0,
+          targetPosition.lat,
+          targetPosition.lng
+        ) : 0;
 
-          newState.telemetry = {
+        return {
+          ...prev,
+          currentPosition,
+          currentWaypointIndex,
+          interpolationProgress,
+          targetPosition,
+          logs,
+          isRunning,
+          distanceTraveled: cumulativeDistance,
+          progress,
+          telemetry: {
             mission_id: selectedMission.id,
             timestamp: new Date().toISOString(),
-            latitude: newState.currentPosition.lat,
-            longitude: newState.currentPosition.lng,
+            latitude: currentPosition?.lat ?? 0,
+            longitude: currentPosition?.lng ?? 0,
             altitude_m: currentWaypoint.altitude_m + (Math.random() - 0.5) * 0.5,
             speed_ms: speed + (Math.random() - 0.5) * 0.5,
             battery_percent: Math.round(currentBattery),
@@ -650,10 +670,8 @@ const MissionExecution: React.FC = () => {
             yaw_deg: heading + (Math.random() - 0.5) * 2,
             gps_fix_type: 3,
             satellites_visible: 8 + Math.floor(Math.random() * 4),
-          };
-        }
-
-        return newState;
+          },
+        };
       });
     }, 100); // Update every 100ms for smooth movement
   };

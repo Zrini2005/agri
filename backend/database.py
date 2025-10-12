@@ -66,6 +66,11 @@ class Mission(Base):
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
     started_at = Column(DateTime(timezone=True))
     completed_at = Column(DateTime(timezone=True))
+    # Simulation state fields for persistence
+    current_waypoint_index = Column(Integer, default=0)
+    distance_traveled = Column(Float, default=0.0)
+    progress = Column(Float, default=0.0)
+    simulation_state = Column(JSON, nullable=True)  # For extensibility (e.g., drone position, logs)
     
     # Relationships
     owner = relationship("User", back_populates="missions")
@@ -144,6 +149,28 @@ class AIInsight(Base):
     
     # Relationships
     mission = relationship("Mission", back_populates="ai_insights")
+
+
+# InferenceImage: stores uploaded images and results from AI inference
+class InferenceImage(Base):
+    __tablename__ = "inference_images"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    mission_id = Column(Integer, ForeignKey("missions.id"), nullable=True)
+    timestamp = Column(DateTime(timezone=True), server_default=func.now())
+    vegetation_percentage = Column(Float, nullable=False)
+    original_path = Column(String(255), nullable=False)
+    mask_path = Column(String(255), nullable=False)
+    overlay_path = Column(String(255), nullable=False)
+    # Optionally, store base64 or BLOB if needed
+    # original_image = Column(LargeBinary)
+    # mask_image = Column(LargeBinary)
+    # overlay_image = Column(LargeBinary)
+
+    # Relationships
+    user = relationship("User")
+    mission = relationship("Mission")
 
 
 # Create all tables

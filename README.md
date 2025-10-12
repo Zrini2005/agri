@@ -31,14 +31,18 @@ A comprehensive web-based ground control station for agricultural drone operatio
    pip install -r requirements.txt
    ```
 
-4. **Initialize database:**
+
+4. **Initialize the database (optional):**
+   Normally, the database tables are created automatically on server startup. If you want to manually initialize tables, run:
    ```bash
-   python database.py
+   # From the project root
+   PYTHONPATH=./backend venv/bin/python -c 'from database import create_tables; create_tables()'
    ```
 
-5. **Start the server:**
+5. **Start the backend server (recommended):**
    ```bash
-   python main.py
+   # Use uvicorn for proper FastAPI event handling
+   uvicorn main:app --reload --host 0.0.0.0 --port 8000
    ```
 
 Backend will be available at `http://localhost:8000`
