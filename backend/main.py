@@ -1,5 +1,5 @@
 from typing import Optional
-from fastapi import FastAPI, Depends, HTTPException, status, WebSocket, WebSocketDisconnect, UploadFile, File
+from fastapi import FastAPI, Depends, HTTPException, status, WebSocket, WebSocketDisconnect, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
@@ -1131,14 +1131,27 @@ async def handle_mission_status_update(data: dict):
 @app.post("/inference/analyze")
 async def analyze_image(
     file: UploadFile = File(...),
+    mode: str = Form("vegetation"),  # 'vegetation' or 'weed'
     current_user: schemas.User = Depends(get_current_active_user),
     db: Session = Depends(get_db)
 ):
     """
-    Upload an image and run vegetation segmentation inference.
-    Returns the mask and vegetation percentage.
+    Upload an image and run AI inference (vegetation segmentation or weed detection).
+    
+    Parameters:
+    - file: Image file to analyze
+    - mode: 'vegetation' for vegetation segmentation or 'weed' for weed detection
+    
+    Returns the mask, percentage, and optionally plotted image for weed mode.
     """
+    print(f"🔥 ENDPOINT CALLED WITH MODE: '{mode}'")
+    print(f"🔥 MODE TYPE: {type(mode)}")
+    
     try:
+        # Import numpy explicitly to ensure it's available in function scope
+        import numpy as np
+        from PIL import Image as PILImage
+        
         # Ensure upload directory exists
         os.makedirs("static/uploads", exist_ok=True)
         os.makedirs("static/results", exist_ok=True)
@@ -1154,17 +1167,47 @@ async def analyze_image(
         
         print(f"Image saved to: {filepath}")
         
-        # Try to run inference
+        # Validate mode
+        if mode not in ['vegetation', 'weed']:
+            raise HTTPException(status_code=400, detail="Mode must be 'vegetation' or 'weed'")
+        
+        # Initialize variables
+        mask = None
+        vegetation_percentage = 0.0
+        plotted_rgb = None
+        has_plotted = False
+        detection_stats = None
+        
+        # Try to run inference with the new inference module
         try:
             from inference import run_inference
-            mask, vegetation_percentage = run_inference(filepath)
+            
+            # Run inference based on mode
+            result = run_inference(filepath, mode=mode)
+            
+            # Handle different return formats
+            if mode == 'weed':
+                # Weed mode returns: (mask, percentage, plotted_rgb, detection_stats)
+                if len(result) == 4:
+                    mask, vegetation_percentage, plotted_rgb, detection_stats = result
+                else:
+                    # Fallback format without stats
+                    mask, vegetation_percentage, plotted_rgb = result
+                has_plotted = plotted_rgb is not None
+            else:
+                # Vegetation mode returns: (mask, percentage)
+                mask, vegetation_percentage = result
+                plotted_rgb = None
+                has_plotted = False
+                
         except Exception as inference_error:
             print(f"Inference error: {str(inference_error)}")
+            import traceback
+            traceback.print_exc()
             print("Falling back to simple green color detection...")
             
-            # Fallback: Simple green color detection
+            # Fallback: Simple green color detection using already imported modules
             from PIL import Image as PILImage
-            import numpy as np
             
             img = PILImage.open(filepath).convert('RGB')
             img_array = np.array(img)
@@ -1176,6 +1219,8 @@ async def analyze_image(
             
             mask = green_mask.astype(np.float32)
             vegetation_percentage = (np.sum(mask) / mask.size) * 100
+            plotted_rgb = None
+            has_plotted = False
             
             print(f"Fallback detection: {vegetation_percentage:.2f}% vegetation")
         
@@ -1184,9 +1229,25 @@ async def analyze_image(
         mask_img = Image.fromarray(mask_normalized, mode='L')
         
         # Save mask image
-        mask_filename = f"mask_{filename}"
+        mask_filename = f"mask_{mode}_{filename}"
         mask_filepath = os.path.join("static/results", mask_filename)
         mask_img.save(mask_filepath)
+        
+        # For weed mode, save the plotted image if available
+        plotted_filename = None
+        plotted_filepath = None
+        plotted_base64 = None
+        
+        if mode == 'weed' and has_plotted:
+            from PIL import Image as PILImage
+            plotted_filename = f"plotted_{filename}"
+            plotted_filepath = os.path.join("static/results", plotted_filename)
+            plotted_pil = PILImage.fromarray(plotted_rgb)
+            plotted_pil.save(plotted_filepath)
+            
+            # Convert to base64
+            with open(plotted_filepath, "rb") as img_file:
+                plotted_base64 = base64.b64encode(img_file.read()).decode('utf-8')
         
         # Create overlay image
         original_img = Image.open(filepath).convert('RGBA')
@@ -1196,16 +1257,22 @@ async def analyze_image(
         mask_resized = mask_img.resize(original_img.size, Image.Resampling.LANCZOS)
         mask_array = np.array(mask_resized)
         
-        # Create green overlay where vegetation is detected
+        # Create colored overlay based on mode
         overlay_array = np.array(mask_rgba)
-        overlay_array[mask_array > 128] = [0, 255, 0, 100]  # Green with transparency
+        if mode == 'weed':
+            # Red overlay for weed detection
+            overlay_array[mask_array > 128] = [255, 0, 0, 120]  # Red with transparency
+        else:
+            # Green overlay for vegetation
+            overlay_array[mask_array > 128] = [0, 255, 0, 100]  # Green with transparency
+        
         overlay_img = Image.fromarray(overlay_array, 'RGBA')
         
         # Composite images
         result_img = Image.alpha_composite(original_img, overlay_img)
         
         # Save overlay image
-        overlay_filename = f"overlay_{filename.rsplit('.', 1)[0]}.png"
+        overlay_filename = f"overlay_{mode}_{filename.rsplit('.', 1)[0]}.png"
         overlay_filepath = os.path.join("static/results", overlay_filename)
         result_img.save(overlay_filepath)
         
@@ -1230,8 +1297,10 @@ async def analyze_image(
         db.commit()
         db.refresh(inference_image)
 
-        return {
+        # Build response
+        response = {
             "success": True,
+            "mode": mode,
             "vegetation_percentage": round(vegetation_percentage, 2),
             "original_image": f"data:image/jpeg;base64,{original_base64}",
             "mask_image": f"data:image/png;base64,{mask_base64}",
@@ -1243,12 +1312,173 @@ async def analyze_image(
             "inference_id": inference_image.id
         }
         
+        # Add plotted image for weed mode if available
+        if mode == 'weed' and plotted_base64:
+            response["plotted_image"] = f"data:image/png;base64,{plotted_base64}"
+            response["plotted_path"] = f"/static/results/{plotted_filename}"
+            
+            # Add detection statistics if available
+            if detection_stats:
+                response["weed_count"] = detection_stats.get('weed_count', 0)
+                response["crop_count"] = detection_stats.get('crop_count', 0)
+                response["total_detections"] = detection_stats.get('total_detections', 0)
+        
+        return response
+        
     except Exception as e:
         import traceback
         traceback.print_exc()
         raise HTTPException(
             status_code=500,
             detail=f"Error during inference: {str(e)}"
+        )
+
+
+@app.post("/inference/detect-weeds")
+async def detect_weeds(
+    file: UploadFile = File(...),
+    current_user: schemas.User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Dedicated endpoint for YOLO-based weed detection.
+    
+    Returns:
+    - Plotted image with bounding boxes
+    - Detection statistics (weed_count, crop_count, total_detections)
+    - Coverage percentage
+    """
+    print("\n" + "="*80)
+    print("🦠 WEED DETECTION ENDPOINT CALLED")
+    print("="*80)
+    
+    try:
+        import numpy as np
+        from PIL import Image as PILImage
+        
+        # Ensure directories exist
+        os.makedirs("static/uploads", exist_ok=True)
+        os.makedirs("static/results", exist_ok=True)
+        
+        # Save uploaded file
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        filename = f"{timestamp}_{file.filename}"
+        filepath = os.path.join("static/uploads", filename)
+        
+        contents = await file.read()
+        with open(filepath, "wb") as f:
+            f.write(contents)
+        
+        print(f"📁 Image saved to: {filepath}")
+        
+        # Run YOLO weed detection
+        print("🚀 Calling run_inference with mode='weed'")
+        from inference import run_inference
+        
+        result = run_inference(filepath, mode='weed')
+        
+        # Unpack results
+        if len(result) == 4:
+            mask, vegetation_percentage, plotted_rgb, detection_stats = result
+            print(f"✅ Got 4-element result with detection stats")
+        else:
+            mask, vegetation_percentage, plotted_rgb = result
+            detection_stats = None
+            print(f"⚠️ Got 3-element result, no detection stats")
+        
+        # Convert mask to base64 image
+        mask_normalized = (mask * 255).astype(np.uint8)
+        mask_img = PILImage.fromarray(mask_normalized, mode='L')
+        
+        # Save mask image
+        mask_filename = f"mask_weed_{filename}"
+        mask_filepath = os.path.join("static/results", mask_filename)
+        mask_img.save(mask_filepath)
+        
+        # Save plotted image
+        plotted_filename = f"plotted_{filename}"
+        plotted_filepath = os.path.join("static/results", plotted_filename)
+        plotted_pil = PILImage.fromarray(plotted_rgb)
+        plotted_pil.save(plotted_filepath)
+        print(f"💾 Plotted image saved to: {plotted_filepath}")
+        
+        # Create overlay image with red color for weeds
+        original_img = PILImage.open(filepath).convert('RGBA')
+        mask_rgba = PILImage.new('RGBA', original_img.size, (0, 0, 0, 0))
+        
+        # Resize mask to match original image size
+        mask_resized = mask_img.resize(original_img.size, PILImage.Resampling.LANCZOS)
+        mask_array = np.array(mask_resized)
+        
+        # Create red overlay for weed detection
+        overlay_array = np.array(mask_rgba)
+        overlay_array[mask_array > 128] = [255, 0, 0, 120]  # Red with transparency
+        overlay_img = PILImage.fromarray(overlay_array, 'RGBA')
+        
+        # Composite images
+        result_img = PILImage.alpha_composite(original_img, overlay_img)
+        
+        # Save overlay image
+        overlay_filename = f"overlay_weed_{filename.rsplit('.', 1)[0]}.png"
+        overlay_filepath = os.path.join("static/results", overlay_filename)
+        result_img.save(overlay_filepath)
+        
+        # Convert images to base64
+        def image_to_base64(img_path):
+            with open(img_path, "rb") as img_file:
+                return base64.b64encode(img_file.read()).decode('utf-8')
+        
+        original_base64 = image_to_base64(filepath)
+        mask_base64 = image_to_base64(mask_filepath)
+        overlay_base64 = image_to_base64(overlay_filepath)
+        plotted_base64 = image_to_base64(plotted_filepath)
+        
+        # Save to database
+        inference_image = InferenceImage(
+            user_id=current_user.id if current_user else None,
+            vegetation_percentage=round(vegetation_percentage, 2),
+            original_path=f"/static/uploads/{filename}",
+            mask_path=f"/static/results/{mask_filename}",
+            overlay_path=f"/static/results/{overlay_filename}",
+        )
+        db.add(inference_image)
+        db.commit()
+        db.refresh(inference_image)
+        
+        print(f"📊 Detection stats: {detection_stats}")
+        
+        # Build response
+        response = {
+            "success": True,
+            "mode": "weed",
+            "vegetation_percentage": round(vegetation_percentage, 2),
+            "original_image": f"data:image/jpeg;base64,{original_base64}",
+            "mask_image": f"data:image/png;base64,{mask_base64}",
+            "overlay_image": f"data:image/png;base64,{overlay_base64}",
+            "plotted_image": f"data:image/png;base64,{plotted_base64}",
+            "original_path": f"/static/uploads/{filename}",
+            "mask_path": f"/static/results/{mask_filename}",
+            "overlay_path": f"/static/results/{overlay_filename}",
+            "plotted_path": f"/static/results/{plotted_filename}",
+            "timestamp": datetime.utcnow().isoformat(),
+            "inference_id": inference_image.id,
+            "weed_count": detection_stats.get('weed_count', 0) if detection_stats else 0,
+            "crop_count": detection_stats.get('crop_count', 0) if detection_stats else 0,
+            "total_detections": detection_stats.get('total_detections', 0) if detection_stats else 0,
+        }
+        
+        print("="*80)
+        print("✅ WEED DETECTION COMPLETED")
+        print("="*80 + "\n")
+        
+        return response
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error during weed detection: {str(e)}"
         )
 
 

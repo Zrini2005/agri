@@ -207,14 +207,32 @@ export interface InferenceResult {
   mask_path: string;
   overlay_path: string;
   timestamp: string;
+  plotted_image?: string;  // For YOLO weed detection
+  plotted_path?: string;
+  weed_count?: number;     // Detection statistics
+  crop_count?: number;
+  total_detections?: number;
 }
 
 export const inferenceAPI = {
-  analyzeImage: async (file: File): Promise<InferenceResult> => {
+  analyzeImage: async (file: File, mode: 'vegetation' | 'weed' = 'vegetation'): Promise<InferenceResult> => {
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('mode', mode);
+    
+    const response: AxiosResponse<InferenceResult> = await api.post('/inference/analyze', formData, {
+      headers: {
+        'Content-Type': 'multipart/form-data',
+      },
+    });
+    return response.data;
+  },
+  
+  detectWeeds: async (file: File): Promise<InferenceResult> => {
     const formData = new FormData();
     formData.append('file', file);
     
-    const response: AxiosResponse<InferenceResult> = await api.post('/inference/analyze', formData, {
+    const response: AxiosResponse<InferenceResult> = await api.post('/inference/detect-weeds', formData, {
       headers: {
         'Content-Type': 'multipart/form-data',
       },

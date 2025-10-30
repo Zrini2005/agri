@@ -137,9 +137,7 @@ const Inference: React.FC = () => {
     setWeedError('');
 
     try {
-      console.log('🦠 Calling dedicated weed detection endpoint');
-      const result = await inferenceAPI.detectWeeds(weedFile);
-      console.log('✅ Weed detection result:', result);
+      const result = await inferenceAPI.analyzeImage(weedFile, 'weed');
       setWeedResult(result);
     } catch (err: any) {
       setWeedError(err.response?.data?.detail || 'Failed to analyze image');
@@ -541,52 +539,6 @@ const Inference: React.FC = () => {
                     </Typography>
                   </CardContent>
                 </Card>
-
-                {/* Detection Statistics */}
-                {(weedResult as any).total_detections !== undefined && (
-                  <Card variant="outlined" sx={{ bgcolor: 'rgba(239, 68, 68, 0.05)' }}>
-                    <CardContent>
-                      <Typography variant="subtitle2" sx={{ mb: 2, color: '#ef4444', fontWeight: 600 }}>
-                        📊 Detection Statistics
-                      </Typography>
-                      <Grid container spacing={2}>
-                        <Grid item xs={4}>
-                          <Box sx={{ textAlign: 'center', p: 1, bgcolor: 'rgba(255, 0, 0, 0.1)', borderRadius: 1 }}>
-                            <Typography variant="h5" sx={{ color: '#ef4444', fontWeight: 700 }}>
-                              {(weedResult as any).weed_count || 0}
-                            </Typography>
-                            <Typography variant="caption" color="text.secondary">
-                              Weeds
-                            </Typography>
-                          </Box>
-                        </Grid>
-                        <Grid item xs={4}>
-                          <Box sx={{ textAlign: 'center', p: 1, bgcolor: 'rgba(34, 197, 94, 0.1)', borderRadius: 1 }}>
-                            <Typography variant="h5" sx={{ color: '#22c55e', fontWeight: 700 }}>
-                              {(weedResult as any).crop_count || 0}
-                            </Typography>
-                            <Typography variant="caption" color="text.secondary">
-                              Crops
-                            </Typography>
-                          </Box>
-                        </Grid>
-                        <Grid item xs={4}>
-                          <Box sx={{ textAlign: 'center', p: 1, bgcolor: 'rgba(59, 130, 246, 0.1)', borderRadius: 1 }}>
-                            <Typography variant="h5" sx={{ color: '#3b82f6', fontWeight: 700 }}>
-                              {(weedResult as any).total_detections || 0}
-                            </Typography>
-                            <Typography variant="caption" color="text.secondary">
-                              Total
-                            </Typography>
-                          </Box>
-                        </Grid>
-                      </Grid>
-                      <Typography variant="caption" color="text.secondary" sx={{ mt: 2, display: 'block', textAlign: 'center' }}>
-                        YOLO model detected objects in the image
-                      </Typography>
-                    </CardContent>
-                  </Card>
-                )}
               </Box>
             )}
           </Paper>
@@ -597,4 +549,3 @@ const Inference: React.FC = () => {
 };
 
 export default Inference;
-
